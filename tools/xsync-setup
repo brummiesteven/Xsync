@@ -1,0 +1,670 @@
+#!/usr/bin/bash
+# xsync — installer and VM builder.
+#
+#   sudo tools/xsync-setup install     install systemd units, sudoers, directories
+#   sudo tools/xsync-setup kargs       apply IOMMU kernel args (needs a reboot)
+#   sudo tools/xsync-setup disk        create the VM disk image
+#   sudo tools/xsync-setup render <install|play|maint> [out.xml]
+#   sudo tools/xsync-setup vm <install|play|maint>   render + define the domain
+#   sudo tools/xsync-setup uninstall
+
+set -uo pipefail
+
+XSYNC_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export XSYNC_ROOT
+source "$XSYNC_ROOT/host/bin/xsync-common.sh"
+
+APP_DIR=/var/lib/xsync/app
+TMPL="$XSYNC_ROOT/host/libvirt/xsync-win11.xml.tmpl"
+
+# ---------------------------------------------------------------- cpu pinning
+
+# Build <vcpupin> entries by reading real sibling topology, so the guest's
+# 8-cores-x-2-threads view maps onto genuine SMT pairs rather than a guessed
+# arithmetic split. Getting this wrong silently halves gaming performance.
+gen_cputune() {
+    local want_cores="$XSYNC_VM_CORES"
+    local -a pairs=() seen=()
+    local cpu sib first second
+
+    # Expand "8-15,24-31" into individual CPU numbers.
+    local -a cpus=()
+    local part lo hi
+    IFS=, read -ra parts <<<"$XSYNC_VM_CPUSET"
+    for part in "${parts[@]}"; do
+        if [[ "$part" == *-* ]]; then
+            lo="${part%-*}"; hi="${part#*-}"
+            for ((c=lo; c<=hi; c++)); do cpus+=("$c"); done
+        else
+            cpus+=("$part")
+        fi
+    done
+
+    for cpu in "${cpus[@]}"; do
+        [[ " ${seen[*]:-} " == *" $cpu "* ]] && continue
+        sib="$(cat "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list" 2>/dev/null)"
+        # An unreadable sibling list means the CPU does not exist. Left
+        # unchecked this emitted <vcpupin cpuset=''/>, which fails libvirt's
+        # RelaxNG validation with an error that says nothing about the real
+        # cause -- a CPU number in XSYNC_VM_CPUSET that is not on this machine.
+        [[ -n "$sib" ]] \
+            || die "cpu$cpu from XSYNC_VM_CPUSET='$XSYNC_VM_CPUSET' does not exist on this host (see: lscpu -e)"
+        first="${sib%%,*}"
+        second="${sib##*,}"
+        [[ "$second" == "$first" ]] && second="$first"
+        pairs+=("$first $second")
+        seen+=("$first" "$second")
+    done
+
+    # Refuse to silently under-pin.
+    #
+    # XSYNC_VM_CORES is documented as raisable to 12, but the pairs come from
+    # XSYNC_VM_CPUSET -- so asking for 12 cores against an 8-pair cpuset emitted
+    # 8 pinned cores and left the other 4 floating across CCDs. That is exactly
+    # the cross-L3 stutter the pinning exists to prevent, and it happened with
+    # no warning at all.
+    if (( ${#pairs[@]} < want_cores )); then
+        die "XSYNC_VM_CORES=$want_cores but XSYNC_VM_CPUSET='$XSYNC_VM_CPUSET' only yields ${#pairs[@]} sibling pair(s).
+Widen XSYNC_VM_CPUSET to cover the cores you want, or lower XSYNC_VM_CORES.
+Leaving them unpinned would let vCPUs float across CCDs and cost frametime consistency."
+    fi
+
+    local i=0 vcpu=0 out=""
+    for p in "${pairs[@]}"; do
+        (( i >= want_cores )) && break
+        read -r first second <<<"$p"
+        out+="    <vcpupin vcpu='$vcpu' cpuset='$first'/>"$'\n'
+        out+="    <vcpupin vcpu='$((vcpu+1))' cpuset='$second'/>"$'\n'
+        (( vcpu += 2 )); (( i++ ))
+    done
+
+    out+="    <emulatorpin cpuset='$XSYNC_VM_EMULATOR_CPUSET'/>"$'\n'
+    out+="    <iothreadpin iothread='1' cpuset='$XSYNC_VM_EMULATOR_CPUSET'/>"
+    printf '%s' "$out"
+}
+
+# ---------------------------------------------------------------- xml rendering
+
+# PCI addresses are sliced by byte offset below (${VAR:5:2} and friends), which
+# silently produces nonsense for anything but the full domain:bus:slot.function
+# form. `lspci` prints the short form by default, so hand-copying from it yields
+# bus='0x.0' slot='0x' function='0x' -- still well-formed XML, so it passes
+# every validation and only fails later at virsh define, or defines a domain
+# pointing at nothing. Since there is no setup wizard, hand-editing IS the
+# expected path, so this has to be caught here.
+check_pci_addr() {
+    local name="$1" value="$2"
+    [[ -n "$value" ]] || return 0
+    [[ "$value" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]] \
+        || die "$name='$value' is not a full PCI address.
+Use the domain:bus:slot.function form exactly as 'lspci -D' prints it, e.g. 0000:01:00.0"
+}
+
+render() {
+    local profile="${1:-play}" out="${2:-}"
+    [[ -f "$TMPL" ]] || die "template not found: $TMPL"
+
+    check_pci_addr XSYNC_GPU_PCI       "${XSYNC_GPU_PCI:-}"
+    check_pci_addr XSYNC_GPU_AUDIO_PCI "${XSYNC_GPU_AUDIO_PCI:-}"
+    check_pci_addr XSYNC_USB_PCI       "${XSYNC_USB_PCI:-}"
+
+    local hostdevs graphics install_media boot bootmenu cores vcpus
+    cores="$XSYNC_VM_CORES"
+    vcpus=$(( cores * 2 ))
+
+    # libvirt rejects OS-level <boot> mixed with per-device <boot order>, so boot
+    # order is expressed here rather than on the disks.
+    #
+    # The boot menu is useful during installation, where booting from the right
+    # disc sometimes needs a nudge, and actively harmful in the play profile: it
+    # puts a firmware menu on the TV for three seconds at the start of every
+    # single game launch, and it is the first thing the user sees after the GPU
+    # changes hands. Nobody is going to press F12 from a sofa.
+    case "$profile" in
+        install)
+            boot="    <boot dev='cdrom'/>
+    <boot dev='hd'/>"
+            bootmenu="    <bootmenu enable='yes' timeout='3000'/>"
+            ;;
+        *)
+            boot="    <boot dev='hd'/>"
+            bootmenu="    <bootmenu enable='no'/>"
+            ;;
+    esac
+
+    case "$profile" in
+        install|maint)
+            # No passthrough: Windows installs over VNC while the TV keeps showing Steam.
+            hostdevs="    <!-- ${profile} profile: no passthrough -->"
+            # The VNC keymap must match the *guest's* keyboard layout, not the
+            # host's. QEMU translates incoming X keysyms to scancodes using this
+            # map; if it says en-us while the guest is set to en-gb, symbols that
+            # differ between the layouts land wrong or vanish entirely — '@' types
+            # as '2', which quietly breaks any automated sign-in.
+            graphics="    <graphics type='vnc' port='-1' listen='127.0.0.1' keymap='${XSYNC_VNC_KEYMAP:-en-us}'/>
+    <video><model type='virtio' heads='1'/></video>
+    <input type='tablet' bus='usb'/>
+    <input type='keyboard' bus='usb'/>"
+            # Three discs: Windows media, virtio drivers, and the xsync unattend
+            # disc. Setup scans removable volumes for autounattend.xml, so the
+            # third one is what makes the install unattended.
+            #
+            # maint gets none of them. It is for servicing an already-installed
+            # guest — applying settings, checking state, taking screenshots —
+            # without touching the GPU or the TV. Leaving the Windows ISO
+            # attached there would be a standing risk of booting into Setup
+            # against a disk that already has Windows on it.
+            if [[ "$profile" == "install" ]]; then
+                install_media="
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='@WINDOWS_ISO@'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='@VIRTIO_ISO@'/>
+      <target dev='sdb' bus='sata'/>
+      <readonly/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='@UNATTEND_ISO@'/>
+      <target dev='sdc' bus='sata'/>
+      <readonly/>
+    </disk>"
+            else
+                install_media="    <!-- maint profile: no install media -->"
+            fi
+            ;;
+        play)
+            # Optionally hand over a whole USB controller.
+            #
+            # Individual USB hostdev passthrough is not viable for the Xbox
+            # wireless dongle: attaching it resets the device, it re-enumerates
+            # with a new USB device number, and libvirt's freshly recorded
+            # address is stale before it is ever used. The attach reports
+            # success and the guest gets no controller. Passing the controller
+            # itself puts enumeration inside the guest where it belongs.
+            local usb_hostdev=""
+            if [[ -n "${XSYNC_USB_PCI:-}" ]]; then
+                usb_hostdev="    <hostdev mode='subsystem' type='pci' managed='no'>
+      <source><address domain='0x0000' bus='0x${XSYNC_USB_PCI:5:2}' slot='0x${XSYNC_USB_PCI:8:2}' function='0x${XSYNC_USB_PCI:11:1}'/></source>
+    </hostdev>"
+            fi
+
+            # Hide the TianoCore firmware splash.
+            #
+            # There is no emulated display in this profile, so the only thing
+            # OVMF can draw on is the passed-through GPU -- and the only way it
+            # knows how is the GOP driver in that card's PCI option ROM. Take
+            # the ROM BAR away and the firmware has no graphics console at all,
+            # so the TV stays black from power-on until Windows' own driver
+            # brings the card up. That is the whole trick: nothing is being
+            # covered over, the logo is simply never drawn.
+            #
+            # The cost is that the firmware phase is now genuinely headless --
+            # no boot menu, no setup screen, no error text if something goes
+            # wrong. bootmenu is already disabled, so nothing is lost in normal
+            # use, but set XSYNC_HIDE_FIRMWARE_LOGO=0 if you ever need to see
+            # what the firmware is doing.
+            #
+            # Windows does not need the ROM: the NVIDIA driver initialises the
+            # card itself. If a future driver ever regresses on that, the guest
+            # will come up with no display -- revert this first.
+            local gpu_rom=""
+            if [[ "${XSYNC_HIDE_FIRMWARE_LOGO:-1}" == "1" ]]; then
+                gpu_rom="
+      <rom bar='off'/>"
+            fi
+
+            # The guest owns the GPU and drives the TV directly.
+            hostdevs="    <hostdev mode='subsystem' type='pci' managed='no'>
+      <source><address domain='0x0000' bus='0x${XSYNC_GPU_PCI:5:2}' slot='0x${XSYNC_GPU_PCI:8:2}' function='0x${XSYNC_GPU_PCI:11:1}'/></source>${gpu_rom}
+      <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0' multifunction='on'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <source><address domain='0x0000' bus='0x${XSYNC_GPU_AUDIO_PCI:5:2}' slot='0x${XSYNC_GPU_AUDIO_PCI:8:2}' function='0x${XSYNC_GPU_AUDIO_PCI:11:1}'/></source>
+      <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x1'/>
+    </hostdev>
+${usb_hostdev}"
+            # No virtual display: the real GPU is the display.
+            graphics="    <!-- play profile: the passthrough GPU is the display -->"
+            install_media=""
+            ;;
+        *) die "unknown profile '$profile' (expected: install|play|maint)" ;;
+    esac
+
+    # Check the status explicitly: gen_cputune runs in a command substitution,
+    # so a `die` inside it only kills the subshell. Without this the parent
+    # carried on with an empty cputune and rendered a domain with no pinning at
+    # all -- the config error was printed and then completely ignored.
+    local cputune
+    if ! cputune="$(gen_cputune)"; then
+        die "could not build CPU pinning from XSYNC_VM_CPUSET/XSYNC_VM_CORES (see the error above)"
+    fi
+    [[ -n "$cputune" ]] || die "CPU pinning came out empty — check XSYNC_VM_CPUSET"
+
+    local xml
+    xml="$(cat "$TMPL")"
+    xml="${xml//@NAME@/$XSYNC_VM_NAME}"
+    xml="${xml//@PROFILE@/$profile}"
+    xml="${xml//@RAM_KIB@/$(( XSYNC_VM_RAM_MIB * 1024 ))}"
+    xml="${xml//@VCPUS@/$vcpus}"
+    xml="${xml//@CORES@/$cores}"
+    xml="${xml//@DISK@/$XSYNC_VM_DISK}"
+    xml="${xml//@CPUTUNE@/$cputune}"
+    xml="${xml//@HOSTDEVS@/$hostdevs}"
+    xml="${xml//@GRAPHICS@/$graphics}"
+    xml="${xml//@INSTALL_MEDIA@/$install_media}"
+    xml="${xml//@BOOT@/$boot}"
+    xml="${xml//@BOOTMENU@/$bootmenu}"
+    xml="${xml//@WINDOWS_ISO@/${XSYNC_WINDOWS_ISO:-/var/lib/xsync/iso/win11.iso}}"
+    xml="${xml//@VIRTIO_ISO@/${XSYNC_VIRTIO_ISO:-/var/lib/xsync/iso/virtio-win.iso}}"
+    xml="${xml//@UNATTEND_ISO@/${XSYNC_UNATTEND_ISO:-/var/lib/xsync/iso/xsync-unattend.iso}}"
+
+    if [[ -n "$out" ]]; then
+        printf '%s\n' "$xml" >"$out"
+        log "rendered $profile profile -> $out"
+    else
+        printf '%s\n' "$xml"
+    fi
+}
+
+# ---------------------------------------------------------------- install
+
+do_install() {
+    need_root
+
+    log "creating directories"
+    install -d -m 0755 /var/lib/xsync /var/lib/xsync/iso /var/log/xsync
+
+    # Install a root-owned COPY by default.
+    #
+    # systemd runs xsync-session from $APP_DIR as root, and sudoers grants the
+    # desktop user NOPASSWD on xsync-recover there. If $APP_DIR were a symlink
+    # into $HOME, anything running as that user — a compromised browser, a game,
+    # a malicious Steam shortcut — could rewrite those scripts and get root at
+    # the next launch, and could trigger that launch itself. --dev opts into the
+    # symlink for development, where edits need to take effect immediately.
+    if [[ -L "$APP_DIR" || -e "$APP_DIR" ]]; then
+        rm -rf "$APP_DIR"
+    fi
+    if [[ "${XSYNC_DEV_INSTALL:-0}" == "1" ]]; then
+        ln -s "$XSYNC_ROOT" "$APP_DIR"
+        warn "DEV INSTALL: $APP_DIR is a symlink into $XSYNC_ROOT"
+        warn "root executes code from a user-writable path — do not use this on a shared machine"
+    else
+        install -d -m 0755 "$APP_DIR"
+        cp -a "$XSYNC_ROOT/host" "$XSYNC_ROOT/guest" "$XSYNC_ROOT/tools" "$XSYNC_ROOT/config" "$APP_DIR/"
+        chown -R root:root "$APP_DIR"
+        find "$APP_DIR" -type d -exec chmod 0755 {} +
+        find "$APP_DIR" -type f -exec chmod 0644 {} +
+        chmod 0755 "$APP_DIR"/host/bin/* "$APP_DIR"/tools/* 2>/dev/null || true
+        # The config can hold an API key and the guest password, so keep it off
+        # world-read. It must stay readable by the desktop user though: the
+        # library sync deliberately drops to that user before touching Steam's
+        # files, and root-only config makes it die on startup with a traceback.
+        chown "root:${XSYNC_USER}" "$APP_DIR/config/xsync.conf" 2>/dev/null || true
+        chmod 0640 "$APP_DIR/config/xsync.conf" 2>/dev/null || true
+        log "installed a root-owned copy at $APP_DIR"
+    fi
+
+    # Tighten the SOURCE config too, not just the installed copy.
+    #
+    # Only the copy under $APP_DIR was being locked down, which left the file
+    # people actually edit sitting at 0644 with a live API key and the guest
+    # password in it. Under --dev the two are the same file, so the world
+    # readable one WAS the installed one.
+    if [[ -f "$XSYNC_ROOT/config/xsync.conf" ]]; then
+        if chmod 0640 "$XSYNC_ROOT/config/xsync.conf" 2>/dev/null; then
+            log "tightened $XSYNC_ROOT/config/xsync.conf to 0640 (it holds credentials)"
+        else
+            warn "could not chmod $XSYNC_ROOT/config/xsync.conf — it may be world-readable"
+        fi
+    fi
+
+    # Windows 11 requires a TPM, which means swtpm, which manufactures a vTPM via
+    # a local CA on first VM start. It runs as the unprivileged 'tss' user and
+    # cannot create its own state directory, so the VM fails to start with a
+    # thoroughly unhelpful "Could not run swtpm_setup" unless this exists first.
+    log "preparing swtpm state directory"
+    install -d -m 0750 /var/lib/swtpm-localca
+    chown tss:tss /var/lib/swtpm-localca 2>/dev/null || warn "could not chown swtpm-localca to tss"
+    restorecon -R /var/lib/swtpm-localca 2>/dev/null || true
+    restorecon -R /var/lib/libvirt /var/log/libvirt 2>/dev/null || true
+
+    # Enforce exec bits rather than trusting the checkout. A script that loses its
+    # executable bit fails at runtime as a bare "command not found" from sudo,
+    # which is a genuinely confusing way to discover the problem mid-handoff.
+    log "ensuring host scripts are executable"
+    chmod +x "$XSYNC_ROOT"/host/bin/* "$XSYNC_ROOT"/tools/* 2>/dev/null || true
+
+    # SELinux: files created under /var/lib inherit var_lib_t, and systemd
+    # (init_t) is not permitted to execute that type. Without a relabel every
+    # xsync unit fails with a bare "Permission denied ... status=203/EXEC",
+    # which looks like a file-mode problem and is not. semanage makes it
+    # survive a full filesystem relabel; chcon applies it now.
+    log "labelling executables for SELinux"
+    if command -v semanage >/dev/null 2>&1; then
+        semanage fcontext -a -t bin_t "${APP_DIR}/host/bin(/.*)?" 2>/dev/null || true
+        semanage fcontext -a -t bin_t "${APP_DIR}/tools(/.*)?" 2>/dev/null || true
+        restorecon -R "${APP_DIR}/host/bin" "${APP_DIR}/tools" 2>/dev/null || true
+    fi
+    chcon -R -t bin_t "${APP_DIR}/host/bin" "${APP_DIR}/tools" 2>/dev/null \
+        || warn "could not set SELinux labels; units may fail with 203/EXEC"
+
+    # Who owns the Xbox wireless dongle.
+    #
+    # Two passthrough strategies, and they want opposite things:
+    #
+    #   XSYNC_USB_PCI set (the default, and what this machine uses) — the whole
+    #   xHCI controller is handed to the guest. Every device on it leaves the
+    #   host together and the PCI unbind tears their drivers down cleanly, so
+    #   the host driver may stay loaded. It *should* stay loaded: the host needs
+    #   the dongle for native Steam gaming, and leaving the controller paired to
+    #   the dongle rather than to host Bluetooth means it simply follows the
+    #   dongle across a handoff instead of having to reconnect.
+    #
+    #   XSYNC_USB_PCI empty — individual USB devices are attached instead. There
+    #   the driver must be kept out of the kernel: unbinding it just before the
+    #   VM starts does not work, because the kernel re-probes and xone-dongle
+    #   takes the device straight back. QEMU then gets nothing while libvirt
+    #   still reports the hostdev as attached, which is very hard to spot.
+    #
+    # Blacklisting under controller passthrough is not merely unnecessary, it is
+    # actively harmful: an unbound dongle never receives its firmware, so it goes
+    # completely dead on the host — no LED, no response to the pair button. That
+    # looks exactly like failed hardware.
+    if [[ -n "${XSYNC_USB_PCI:-}" ]]; then
+        if [[ -e /etc/modprobe.d/xsync-dongle.conf ]]; then
+            log "removing the stale xone_dongle blacklist (controller passthrough needs no reservation)"
+            rm -f /etc/modprobe.d/xsync-dongle.conf
+        fi
+        # Load it now so the dongle works on the host without a reboot.
+        modprobe xone_dongle 2>/dev/null \
+            && log "xone_dongle loaded; the dongle works on the host and follows the USB controller into the guest" \
+            || warn "could not load xone_dongle; the host will have no dongle support"
+    elif [[ "${XSYNC_DONGLE_RESERVE:-1}" == "1" ]]; then
+        log "reserving the Xbox dongle for the guest (blacklisting xone_dongle)"
+        cat >/etc/modprobe.d/xsync-dongle.conf <<'EOF'
+# The Xbox wireless dongle belongs to the xsync guest, not the host.
+#
+# This file is only correct when xsync attaches the dongle as an individual USB
+# device (XSYNC_USB_PCI empty). Unbinding it just before the VM starts does not
+# work: the kernel re-probes immediately and xone-dongle takes it straight back,
+# so QEMU never gets the device and the guest has no controller — while libvirt
+# still reports the hostdev as successfully attached.
+#
+# The cost is that the dongle is then dead on the host: with no driver bound it
+# never receives its firmware, so it shows no LED and ignores the pair button.
+# The host must use Bluetooth for its own controller.
+#
+# To give the dongle back to the host: delete this file and `modprobe xone_dongle`.
+blacklist xone_dongle
+EOF
+        # Free it now, so a reboot is not required.
+        for iface in /sys/bus/usb/drivers/xone-dongle/*:*; do
+            [[ -e "$iface" ]] || continue
+            echo "$(basename "$iface")" >/sys/bus/usb/drivers/xone-dongle/unbind 2>/dev/null || true
+        done
+        modprobe -r xone_dongle 2>/dev/null \
+            && log "xone_dongle unloaded; dongle is free for the guest" \
+            || warn "could not unload xone_dongle (in use?); it will stay off after a reboot"
+    fi
+
+    log "installing systemd units"
+    install -m 0644 "$XSYNC_ROOT/host/systemd/xsync-session@.service" /etc/systemd/system/
+    install -m 0644 "$XSYNC_ROOT/host/systemd/xsync-recover.service" /etc/systemd/system/
+    install -m 0644 "$XSYNC_ROOT/host/systemd/xsync-display-watch.service" /etc/systemd/system/
+    install -m 0644 "$XSYNC_ROOT/host/systemd/xsync-maintain.service" /etc/systemd/system/
+    install -m 0644 "$XSYNC_ROOT/host/systemd/xsync-maintain.timer" /etc/systemd/system/
+    systemctl daemon-reload
+    # --now, not just enable.
+    #
+    # Plain `enable` only takes effect at the next boot, so a fresh install left
+    # both of these inert until the machine was rebooted -- on a box whose whole
+    # point is that it is never rebooted. The maintenance timer showed no NEXT
+    # run at all, which is exactly how it went unnoticed.
+    systemctl enable --now xsync-display-watch.service >/dev/null 2>&1 \
+        && log "display watch enabled (restores gaming mode when the TV returns)" \
+        || warn "display watch NOT enabled — gaming mode will not return after TV standby"
+
+    # The whole point of the maintenance timer is that nobody has to remember it.
+    # Writing the units and never enabling them produced the exact failure it
+    # exists to prevent: a guest that quietly stops being updated, on a machine
+    # whose user has no keyboard and no route to Windows Update.
+    systemctl enable --now xsync-maintain.timer >/dev/null 2>&1 \
+        && log "weekly guest maintenance enabled (idle-gated; runs only when nobody is using the TV)" \
+        || warn "could not enable xsync-maintain.timer — the guest will not self-update"
+
+    # Let the unprivileged Steam session trigger exactly these two things.
+    #
+    # Validate BEFORE installing, never after. sudo refuses to load *any*
+    # sudoers source when a single drop-in fails to parse, so writing the file
+    # first and checking it second means a bad value locks the user out of sudo
+    # entirely — and the fix then needs a root shell they no longer have.
+    log "installing sudoers rule"
+
+    # An empty XSYNC_USER survives `set -u` and would emit a line starting with
+    # " ALL=(root)", which is exactly the kind of invalid file described above.
+    [[ -n "${XSYNC_USER:-}" ]] || die "XSYNC_USER is empty — refusing to write a sudoers rule"
+    id -u "$XSYNC_USER" >/dev/null 2>&1 || die "XSYNC_USER '$XSYNC_USER' is not a real user"
+
+    # visudo lives in /usr/sbin, which is not always on PATH for a sudo'd shell.
+    local visudo=""
+    for c in visudo /usr/sbin/visudo /sbin/visudo; do
+        command -v "$c" >/dev/null 2>&1 && { visudo="$c"; break; }
+    done
+    [[ -n "$visudo" ]] || die "visudo not found — refusing to install an unvalidated sudoers rule"
+
+    local sudoers_tmp
+    sudoers_tmp="$(mktemp)"
+    cat >"$sudoers_tmp" <<EOF
+# Allow the desktop user to start an xsync play session and to recover from a
+# failed one. Nothing else is granted.
+#
+# NO WILDCARDS. sudoers(5): "Because command line arguments are matched as a
+# single, concatenated string, a wildcard can match multiple arguments." The
+# previous rule was
+#     NOPASSWD: /usr/bin/systemctl start --no-block xsync-session@*.service
+# and the * spanned a space, so this was permitted and demonstrated:
+#     sudo systemctl start --no-block xsync-session@x.service anything-else.service
+# i.e. start ANY unit as root, passwordless. The comment above claimed nothing
+# else was granted; it granted the machine. Validation now lives in
+# xsync-start-session, which takes one argument and checks it.
+$XSYNC_USER ALL=(root) NOPASSWD: $APP_DIR/host/bin/xsync-start-session
+$XSYNC_USER ALL=(root) NOPASSWD: /usr/bin/systemctl start xsync-recover.service
+$XSYNC_USER ALL=(root) NOPASSWD: $APP_DIR/host/bin/xsync-recover ""
+EOF
+    if ! "$visudo" -cf "$sudoers_tmp" >/dev/null 2>&1; then
+        "$visudo" -cf "$sudoers_tmp" || true
+        rm -f "$sudoers_tmp"
+        die "generated sudoers file is invalid — nothing was installed"
+    fi
+    install -m 0440 -o root -g root "$sudoers_tmp" /etc/sudoers.d/xsync
+    rm -f "$sudoers_tmp"
+    log "sudoers rule validated and installed"
+
+    log "enabling libvirtd"
+    systemctl enable --now libvirtd >/dev/null 2>&1 || warn "could not enable libvirtd"
+
+    # The default NAT network gives the guest internet access for Game Pass.
+    if ! virsh --connect qemu:///system net-info default >/dev/null 2>&1; then
+        warn "libvirt 'default' network missing — the guest will have no internet"
+    else
+        virsh --connect qemu:///system net-start default >/dev/null 2>&1 || true
+        virsh --connect qemu:///system net-autostart default >/dev/null 2>&1 || true
+        log "libvirt default network active"
+    fi
+
+    log "install complete"
+}
+
+do_uninstall() {
+    need_root
+
+    # Never uninstall out from under a live session.
+    #
+    # rm -rf "$APP_DIR" below deletes the very scripts a running xsync-session is
+    # about to call. The failure is not partial: vm.sh stop ENOENTs, the EXIT
+    # trap takes the "VM will not die" branch and by design refuses to touch the
+    # GPU, session.sh start ENOENTs too -- and xsync-recover and the sudoers rule
+    # have just been deleted as well. The machine is left with the GPU on
+    # vfio-pci, the display manager stopped, and no gamepad route back. Black TV,
+    # reboot only, from a command that printed "uninstalled" and exited 0.
+    if [[ "${1:-}" != "--force" ]]; then
+        local _busy=""
+        session_unit_live && _busy="a session is active"
+        [[ -z "$_busy" ]] && [[ -x "$APP_DIR/host/bin/vm.sh" ]] \
+            && ! "$APP_DIR/host/bin/vm.sh" gone >/dev/null 2>&1 && _busy="the VM is still up"
+        [[ -z "$_busy" ]] && [[ -x "$APP_DIR/host/bin/gpu.sh" ]] \
+            && [[ "$("$APP_DIR/host/bin/gpu.sh" bound 2>/dev/null)" != "host" ]] \
+            && _busy="the GPU is not back on the host"
+        if [[ -n "$_busy" ]]; then
+            die "refusing to uninstall: $_busy — recover first (sudo systemctl start xsync-recover.service), or pass --force"
+        fi
+    fi
+
+    # Stop and disable before removing the unit files, or systemd is left with
+    # an enabled symlink pointing at nothing.
+    log "stopping and disabling units"
+    systemctl disable --now xsync-display-watch.service >/dev/null 2>&1 || true
+    systemctl disable --now xsync-maintain.timer >/dev/null 2>&1 || true
+    systemctl stop xsync-maintain.service >/dev/null 2>&1 || true
+    systemctl stop xsync-recover.service >/dev/null 2>&1 || true
+
+    rm -f /etc/systemd/system/xsync-session@.service \
+          /etc/systemd/system/xsync-recover.service \
+          /etc/systemd/system/xsync-display-watch.service \
+          /etc/systemd/system/xsync-maintain.service \
+          /etc/systemd/system/xsync-maintain.timer
+    rm -f /etc/sudoers.d/xsync
+
+    # Give the dongle back. Leaving this behind means the user's controller
+    # stays dead on the host after they have uninstalled the thing that broke
+    # it, with nothing left on disk to explain why.
+    if [[ -e /etc/modprobe.d/xsync-dongle.conf ]]; then
+        log "removing the xone_dongle blacklist and reloading the driver"
+        rm -f /etc/modprobe.d/xsync-dongle.conf
+        modprobe xone_dongle 2>/dev/null || warn "could not load xone_dongle"
+    fi
+
+    # -rf, and only ever against the literal install path: rm -f on a directory
+    # fails silently, which left the root-owned copy behind on every uninstall.
+    if [[ "$APP_DIR" == "/var/lib/xsync/app" ]]; then
+        rm -rf "$APP_DIR"
+    else
+        warn "APP_DIR is '$APP_DIR', not the expected path — leaving it alone"
+    fi
+
+    # SELinux file contexts outlive the files they described.
+    if command -v semanage >/dev/null 2>&1; then
+        semanage fcontext -d "${APP_DIR}/host/bin(/.*)?" 2>/dev/null || true
+        semanage fcontext -d "${APP_DIR}/tools(/.*)?"    2>/dev/null || true
+    fi
+
+    systemctl daemon-reload
+    log "uninstalled (VM disk, ISOs and config left alone)"
+}
+
+# ---------------------------------------------------------------- kargs
+
+do_kargs() {
+    need_root
+    log "applying IOMMU kernel arguments"
+    # Deliberately NOT setting vfio_pci.ids: in handoff mode the host must own the
+    # GPU at boot so native Steam games still get it. Binding happens at launch.
+    rpm-ostree kargs \
+        --append-if-missing="amd_iommu=on" \
+        --append-if-missing="iommu=pt" \
+        --append-if-missing="kvm.ignore_msrs=1" \
+        || die "rpm-ostree kargs failed"
+    echo
+    log "kernel arguments staged — a REBOOT is required for them to take effect"
+}
+
+# ---------------------------------------------------------------- disk
+
+do_disk() {
+    need_root
+    install -d -m 0755 "$XSYNC_VM_STORAGE_DIR"
+
+    if [[ -f "$XSYNC_VM_DISK" ]]; then
+        warn "disk already exists: $XSYNC_VM_DISK — leaving it alone"
+        return 0
+    fi
+
+    # On btrfs, copy-on-write on a VM image causes severe fragmentation and
+    # stutter. The +C attribute must be set on an empty file to take effect.
+    log "creating $XSYNC_VM_DISK ($XSYNC_VM_DISK_SIZE, sparse)"
+    touch "$XSYNC_VM_DISK"
+    if chattr +C "$XSYNC_VM_DISK" 2>/dev/null; then
+        log "disabled copy-on-write on the image (btrfs)"
+    else
+        warn "could not disable COW — fine on non-btrfs, worth checking otherwise"
+    fi
+    truncate -s "$XSYNC_VM_DISK_SIZE" "$XSYNC_VM_DISK"
+    chown qemu:qemu "$XSYNC_VM_DISK" 2>/dev/null || true
+    chmod 0600 "$XSYNC_VM_DISK"
+    log "disk created"
+}
+
+# ---------------------------------------------------------------- vm
+
+do_vm() {
+    need_root
+    local profile="${1:-play}"
+    local xml="/var/lib/xsync/${XSYNC_VM_NAME}-${profile}.xml"
+
+    do_disk
+    render "$profile" "$xml"
+
+    if virsh --connect qemu:///system dominfo "$XSYNC_VM_NAME" >/dev/null 2>&1; then
+        if virsh --connect qemu:///system domstate "$XSYNC_VM_NAME" 2>/dev/null | grep -q running; then
+            die "VM is running — stop it before redefining"
+        fi
+        # Carry the existing UUID across. Without it libvirt mints a new one and
+        # then refuses the define because the name is already taken — which is
+        # what switching between the install and play profiles would otherwise
+        # hit every single time.
+        local uuid
+        uuid="$(virsh --connect qemu:///system domuuid "$XSYNC_VM_NAME" 2>/dev/null | tr -d '[:space:]')"
+        if [[ -n "$uuid" ]]; then
+            sed -i "0,/<name>/s|<name>|<uuid>$uuid</uuid>\n  <name>|" "$xml"
+            log "preserving existing UUID $uuid"
+        fi
+        log "redefining existing domain as '$profile' profile"
+    fi
+
+    virsh --connect qemu:///system define "$xml" || die "virsh define failed"
+    log "domain '$XSYNC_VM_NAME' defined ($profile profile)"
+}
+
+# ---------------------------------------------------------------- entrypoint
+
+case "${1:-}" in
+    install)
+        # --dev symlinks $APP_DIR to the checkout instead of installing a copy.
+        [[ "${2:-}" == "--dev" ]] && export XSYNC_DEV_INSTALL=1
+        do_install ;;
+    uninstall) do_uninstall "${2:-}" ;;
+    kargs)     do_kargs ;;
+    disk)      do_disk ;;
+    render)    render "${2:-play}" "${3:-}" ;;
+    vm)        do_vm "${2:-play}" ;;
+    *)
+        cat >&2 <<EOF
+usage: $0 <command>
+
+  install              install systemd units, sudoers rule, directories
+  kargs                apply IOMMU kernel args (requires reboot)
+  disk                 create the VM disk image
+  render <profile>     print rendered domain XML (install|play|maint)
+  vm <profile>         create disk, render and define the domain
+  uninstall [--force]  remove units and sudoers rule (refuses while a session is live)
+
+EOF
+        exit 64 ;;
+esac

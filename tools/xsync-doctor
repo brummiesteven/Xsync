@@ -1,0 +1,288 @@
+#!/usr/bin/bash
+# xsync — preflight diagnostics.
+#
+#   tools/xsync-doctor
+#
+# Read-only. Checks every precondition the handoff depends on and explains how to
+# fix whatever is missing. Run this before the first launch, and any time the TV
+# does something surprising.
+
+XSYNC_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export XSYNC_ROOT
+# Check for the config BEFORE sourcing, and say something useful when it is
+# missing.
+#
+# xsync-common.sh calls `exit 78` from inside itself, which terminates this
+# script immediately -- so the `|| { echo ... }` fallback below was unreachable
+# and 2>/dev/null swallowed common.sh's own message. The result: on the single
+# most likely first-run state, a fresh clone with no config yet, doctor printed
+# absolutely nothing and exited 78.
+XSYNC_CONF="${XSYNC_CONF:-$XSYNC_ROOT/config/xsync.conf}"
+if [[ ! -r "$XSYNC_CONF" ]]; then
+    cat >&2 <<EOF
+xsync-doctor: no configuration at $XSYNC_CONF
+
+xsync has no autodetection; every machine-specific value has to be set by hand.
+Start from the example and edit it:
+
+    cp config/xsync.conf.example config/xsync.conf
+    \$EDITOR config/xsync.conf
+    tools/xsync-doctor
+
+At minimum you must set XSYNC_GPU_PCI, XSYNC_GPU_AUDIO_PCI, XSYNC_USB_PCI,
+XSYNC_USER, XSYNC_UID, XSYNC_STEAM_ROOT and the CPU pinning values.
+EOF
+    exit 78
+fi
+
+source "$XSYNC_ROOT/host/bin/xsync-common.sh" || {
+    echo "xsync-doctor: failed to load $XSYNC_CONF" >&2
+    exit 78
+}
+
+PASS=0; FAIL=0; WARN=0
+
+ok()    { printf '  \033[32m✓\033[0m %s\n' "$*"; (( PASS++ )); }
+bad()   { printf '  \033[31m✗\033[0m %s\n' "$*"; (( FAIL++ )); }
+meh()   { printf '  \033[33m!\033[0m %s\n' "$*"; (( WARN++ )); }
+hint()  { printf '      → %s\n' "$*"; }
+group() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# ---------------------------------------------------------------- virtualisation
+
+group "Virtualisation"
+
+if [[ -e /dev/kvm ]]; then ok "/dev/kvm present"
+else bad "/dev/kvm missing"; hint "enable SVM/AMD-V in firmware"; fi
+
+if grep -qE '^flags.*\b(svm|vmx)\b' /proc/cpuinfo; then ok "CPU virtualisation extensions available"
+else bad "no svm/vmx in /proc/cpuinfo"; fi
+
+if systemctl is-active libvirtd >/dev/null 2>&1; then ok "libvirtd running"
+else bad "libvirtd not running"; hint "ujust setup-virtualization virt-on, then: sudo systemctl enable --now libvirtd"; fi
+
+for b in virsh qemu-system-x86_64 swtpm; do
+    if command -v "$b" >/dev/null 2>&1; then ok "$b present"
+    else bad "$b missing"; fi
+done
+
+if ls /usr/share/edk2/ovmf/OVMF_CODE*.fd >/dev/null 2>&1 \
+   || ls /usr/share/OVMF/OVMF_CODE*.fd >/dev/null 2>&1; then
+    ok "OVMF firmware present (UEFI + Secure Boot for Windows 11)"
+else
+    bad "OVMF firmware not found"; hint "rpm-ostree install edk2-ovmf"
+fi
+
+# ---------------------------------------------------------------- iommu
+
+group "IOMMU and passthrough"
+
+groups_n=$(ls /sys/kernel/iommu_groups/ 2>/dev/null | wc -l)
+if (( groups_n > 0 )); then ok "IOMMU active ($groups_n groups)"
+else bad "no IOMMU groups"; hint "enable IOMMU/AMD-Vi in firmware and add amd_iommu=on"; fi
+
+for karg in amd_iommu=on iommu=pt; do
+    if grep -qw "$karg" /proc/cmdline; then ok "kernel arg $karg"
+    else meh "kernel arg $karg not set"; hint "rpm-ostree kargs --append-if-missing=\"$karg\" && reboot"; fi
+done
+
+# The host MUST keep the GPU at boot in handoff mode.
+if grep -q 'vfio_pci.ids=' /proc/cmdline; then
+    bad "vfio_pci.ids= is set — the GPU is claimed by VFIO at boot"
+    hint "handoff mode needs the host to own the GPU for native gaming"
+    hint "remove with: rpm-ostree kargs --delete-if-present=\"vfio_pci.ids=...\""
+else
+    ok "no boot-time vfio binding (correct for handoff mode)"
+fi
+
+if modinfo vfio-pci >/dev/null 2>&1; then ok "vfio-pci module available"
+else bad "vfio-pci module unavailable"; fi
+
+# GPU must be alone in its IOMMU group, or passthrough will drag in other devices.
+gpu_group="$(readlink -f "/sys/bus/pci/devices/$XSYNC_GPU_PCI/iommu_group" 2>/dev/null | xargs -r basename)"
+if [[ -n "$gpu_group" ]]; then
+    members=$(ls "/sys/kernel/iommu_groups/$gpu_group/devices/" 2>/dev/null)
+    n=$(echo "$members" | wc -w)
+
+    # Count only the members that are NOT ours.
+    #
+    # This used to compare the group size against `gpu_devices | wc -l`, which
+    # includes the USB controller from a completely different group -- so on
+    # the reference machine it compared 2 against 3 and could never fail. A
+    # group holding the GPU, its audio function AND an unrelated device would
+    # still have been reported as "clean passthrough", which is exactly the
+    # situation the check exists to catch.
+    #
+    # PCI bridges are ignored: VFIO does not need them assigned, and they
+    # legitimately share a group with the devices behind them.
+    strangers=""
+    for m in $members; do
+        gpu_devices | grep -qx "$m" && continue
+        # 0604 = PCI bridge, 0600 = host bridge
+        class="$(cat "/sys/bus/pci/devices/$m/class" 2>/dev/null)"
+        case "$class" in 0x0604*|0x0600*) continue ;; esac
+        strangers+="$m "
+    done
+
+    if [[ -z "$strangers" ]]; then
+        ok "GPU alone in IOMMU group $gpu_group ($n member(s), no foreign devices) — clean passthrough"
+    else
+        bad "IOMMU group $gpu_group also holds devices xsync does not pass through"
+        for m in $strangers; do hint "$m  $(lspci -s "${m#0000:}" 2>/dev/null | cut -d' ' -f2-)"; done
+        hint "passthrough would drag these into the guest, or fail with 'group not viable'"
+    fi
+else
+    bad "cannot resolve IOMMU group for $XSYNC_GPU_PCI"
+fi
+
+# ---------------------------------------------------------------- gpu ownership
+
+group "GPU ownership"
+
+owner="$("$XSYNC_ROOT/host/bin/gpu.sh" bound 2>/dev/null)"
+case "$owner" in
+    host)     ok "host owns the GPU (native gaming unaffected)" ;;
+    vfio-pci) meh "GPU is on vfio-pci — a VM is running, or cleanup was missed"
+              hint "if no VM is running: sudo systemctl start xsync-recover.service" ;;
+    partial)  bad "GPU functions split across drivers — previous run cleaned up badly"
+              hint "sudo systemctl start xsync-recover.service" ;;
+    unbound)  bad "GPU is bound to NO driver — this is the black-TV state"
+              hint "sudo systemctl start xsync-recover.service" ;;
+    *)        bad "cannot determine GPU ownership" ;;
+esac
+
+# A device bound to no driver is a failure, not an observation.
+#
+# This printed a green tick reading "driver: none" -- stating the fault and
+# calling it healthy in the same line, on the one condition that leaves the TV
+# black. Nothing about a driverless GPU is OK.
+while read -r addr; do
+    [[ -n "$addr" ]] || continue
+    if [[ ! -d "/sys/bus/pci/devices/$addr" ]]; then
+        bad "$addr not present on this system"
+        continue
+    fi
+    _d="$(pci_driver "$addr")"
+    if [[ "$_d" == "none" ]]; then
+        bad "$addr present but bound to NO driver"
+    else
+        ok "$addr present, driver: $_d"
+    fi
+done < <(gpu_devices)
+
+# ---------------------------------------------------------------- input
+
+group "Controller"
+
+if lsusb -d "${XSYNC_DONGLE_VENDOR}:${XSYNC_DONGLE_PRODUCT}" >/dev/null 2>&1; then
+    ok "Xbox dongle ${XSYNC_DONGLE_VENDOR}:${XSYNC_DONGLE_PRODUCT} present"
+else
+    meh "Xbox dongle ${XSYNC_DONGLE_VENDOR}:${XSYNC_DONGLE_PRODUCT} not plugged in"
+    hint "the VM needs it for controller input — plug it in before playing"
+fi
+
+# ---------------------------------------------------------------- steam
+
+group "Steam"
+
+if [[ -d "$XSYNC_STEAM_ROOT" ]]; then ok "Steam root $XSYNC_STEAM_ROOT"
+else bad "Steam root not found at $XSYNC_STEAM_ROOT"; fi
+
+profiles=$(ls -d "$XSYNC_STEAM_ROOT"/userdata/*/ 2>/dev/null | wc -l)
+if (( profiles > 0 )); then
+    ok "$profiles Steam profile(s) found"
+    for p in "$XSYNC_STEAM_ROOT"/userdata/*/; do
+        hint "$(basename "$p")  (shortcuts.vdf: $([[ -f "$p/config/shortcuts.vdf" ]] && echo present || echo absent))"
+    done
+else
+    bad "no Steam profiles under $XSYNC_STEAM_ROOT/userdata"
+fi
+
+if [[ -n "$XSYNC_SGDB_API_KEY" ]]; then ok "SteamGridDB API key configured"
+else meh "no SteamGridDB API key — shortcuts will have no artwork"
+     hint "free key: https://www.steamgriddb.com/profile/preferences/api"; fi
+
+# ---------------------------------------------------------------- vm
+
+group "Virtual machine"
+
+# Whether we can talk to libvirt at all has to be established first, because
+# every check below fails identically when we cannot: dominfo returns non-zero,
+# and the old code read that as "the domain is not defined yet".
+#
+# That is the normal case, not an edge case. xsync-doctor is documented as a
+# thing you run as yourself, and connecting to qemu:///system as an ordinary
+# user needs either membership of the 'libvirt' group or a polkit agent — which
+# a plain tty does not have. So the default experience was a confident, wrong
+# "not defined yet" pointing at xsync-setup, on a machine where the domain was
+# defined and running.
+#
+# The real damage is the skipped check: the play-profile test lives in the
+# other branch, and it is the one guarding against launching a GPU-less VM that
+# tears the host session down. Silently not running a safety check reads
+# exactly like passing it.
+if ! virsh --connect qemu:///system version >/dev/null 2>&1; then
+    bad "cannot reach libvirt as $USER — every VM check below was SKIPPED, not passed"
+    hint "re-run with sudo, or add $USER to the 'libvirt' group"
+elif virsh --connect qemu:///system dominfo "$XSYNC_VM_NAME" >/dev/null 2>&1; then
+    ok "domain '$XSYNC_VM_NAME' defined (state: $(virsh --connect qemu:///system domstate "$XSYNC_VM_NAME" 2>/dev/null))"
+
+    # Being defined is not enough. install and maint boot the same disk with no
+    # GPU passthrough, so launching against one of them tears the host session
+    # down and brings the guest up on a display nobody can see.
+    vm_profile="$(virsh --connect qemu:///system dumpxml "$XSYNC_VM_NAME" 2>/dev/null \
+        | sed -n 's|.*<xsync:profile[^>]*>\([^<]*\)</xsync:profile>.*|\1|p' | head -1)"
+    case "$vm_profile" in
+        play) ok "domain is on the 'play' profile (GPU passthrough)" ;;
+        "")   meh "domain records no xsync profile — it was not defined by xsync-setup" ;;
+        *)    bad "domain is on the '$vm_profile' profile — a launch would start a VM with no GPU"
+              hint "sudo tools/xsync-setup vm play" ;;
+    esac
+else
+    meh "domain '$XSYNC_VM_NAME' not defined yet"
+    hint "sudo tools/xsync-setup vm"
+fi
+
+if [[ -f "$XSYNC_VM_DISK" ]]; then
+    ok "disk $XSYNC_VM_DISK ($(du -h --apparent-size "$XSYNC_VM_DISK" 2>/dev/null | cut -f1) allocated, $(du -h "$XSYNC_VM_DISK" 2>/dev/null | cut -f1) on disk)"
+else
+    meh "VM disk not created yet at $XSYNC_VM_DISK"
+fi
+
+avail=$(df --output=avail -BG "$(dirname "$XSYNC_VM_STORAGE_DIR")" 2>/dev/null | tail -1 | tr -dc '0-9')
+if [[ -n "$avail" ]] && (( avail > 100 )); then ok "${avail}G free for VM storage"
+else meh "only ${avail:-?}G free — Game Pass titles are large"; fi
+
+# ---------------------------------------------------------------- recovery
+
+group "Recovery path"
+
+if systemctl is-active sshd >/dev/null 2>&1; then
+    ip=$(ip -4 -brief addr show 2>/dev/null | grep -v '^lo' | awk '{print $3}' | cut -d/ -f1 | head -1)
+    ok "sshd active — recover with: ssh $XSYNC_USER@${ip:-<host>} then sudo systemctl start xsync-recover.service"
+else
+    bad "sshd not running — no out-of-band recovery if the TV goes black"
+    hint "sudo systemctl enable --now sshd"
+fi
+
+if systemctl list-unit-files xsync-session@.service >/dev/null 2>&1 \
+   && systemctl cat xsync-session@.service >/dev/null 2>&1; then
+    ok "xsync systemd units installed"
+else
+    meh "xsync systemd units not installed"
+    hint "sudo tools/xsync-setup install"
+fi
+
+# ---------------------------------------------------------------- summary
+
+printf '\n\033[1mSummary:\033[0m %d passed, %d warnings, %d failed\n' "$PASS" "$WARN" "$FAIL"
+if (( FAIL > 0 )); then
+    printf '\033[31mNot ready.\033[0m Resolve the failures above first.\n'
+    exit 1
+elif (( WARN > 0 )); then
+    printf '\033[33mUsable, with caveats.\033[0m\n'
+    exit 0
+else
+    printf '\033[32mAll checks passed.\033[0m\n'
+    exit 0
+fi

@@ -1,0 +1,99 @@
+#!/usr/bin/bash
+# xsync — unattended guest maintenance.
+#
+#   xsync-maintain          run if the machine is genuinely idle, else do nothing
+#   xsync-maintain --now    run regardless of the idle checks
+#   xsync-maintain --check  report whether it would run, and why not
+#
+# Why this exists: a Windows guest that is never updated rots. Game Pass titles
+# need patching before they will launch, the Xbox stack updates itself, and the
+# GPU driver goes stale — and a Big Picture user has no route to any of it,
+# because there is no keyboard and no desktop to run an installer from.
+#
+# The expensive-but-safe part and the cheap-but-disruptive part are separated
+# deliberately:
+#
+#   Downloading needs no GPU. It runs on the maint profile with the host session
+#   untouched, so it can happen whenever and costs the user nothing.
+#
+#   Installing the GPU driver needs the card actually attached, because the
+#   NVIDIA installer refuses to install for a device that is not present. That
+#   is a real handoff and it takes the display.
+#
+# So the install half only runs when the user is demonstrably not there. The
+# signal is the display being disconnected, which is what a TV in standby looks
+# like and which xsync-display-watch already detects reliably. Anyone who wants
+# it on their own terms uses the Steam entry instead.
+set -uo pipefail
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/xsync-common.sh"
+
+BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+MODE="${1:-auto}"
+
+reasons=()
+
+# 1. Not while a handoff is in progress.
+if ! flock -n 9 2>/dev/null; then
+    reasons+=("an xsync session holds the lock")
+fi 9>"$XSYNC_STATE_DIR/session.lock"
+
+# 2. Not while the VM is already up (someone may be servicing it).
+if ! "$BIN/vm.sh" gone >/dev/null 2>&1; then
+    reasons+=("the VM is already running (state: $("$BIN/vm.sh" state 2>/dev/null))")
+fi
+
+# 3. Not while a native Steam game is running. Maintenance would tear the
+#    session down underneath it.
+if pgrep -u "$XSYNC_USER" -x reaper >/dev/null 2>&1 \
+   || pgrep -u "$XSYNC_USER" -f 'steamapps/common' >/dev/null 2>&1; then
+    reasons+=("a Steam game appears to be running")
+fi
+
+# 4. The display must be gone — that is the "nobody is watching" signal.
+#    NVIDIA exposes no CEC, so a TV in standby reads as disconnected with a
+#    0-byte EDID. See docs/FINDINGS.md.
+display_connected() {
+    local card c
+    card="$(basename "$(readlink -f "/sys/bus/pci/devices/$XSYNC_GPU_PCI/drm/card"* 2>/dev/null | head -1)" 2>/dev/null)"
+    [[ -n "$card" ]] || return 1
+    for c in "/sys/class/drm/${card}"-*; do
+        [[ -e "$c/status" ]] || continue
+        [[ "$(cat "$c/status" 2>/dev/null)" == "connected" ]] && return 0
+    done
+    return 1
+}
+if display_connected; then
+    reasons+=("the display is on — someone is probably using it")
+fi
+
+if [[ "$MODE" == "--check" ]]; then
+    if (( ${#reasons[@]} == 0 )); then
+        echo "would run: all idle checks pass"
+        exit 0
+    fi
+    echo "would NOT run:"
+    printf '  - %s\n' "${reasons[@]}"
+    exit 1
+fi
+
+if [[ "$MODE" != "--now" ]] && (( ${#reasons[@]} > 0 )); then
+    log "skipping maintenance:"
+    printf '  - %s\n' "${reasons[@]}" >&2
+    exit 0
+fi
+
+[[ "$MODE" == "--now" ]] && (( ${#reasons[@]} > 0 )) \
+    && warn "--now given; running despite: ${reasons[*]}"
+
+need_root
+log "starting unattended guest maintenance"
+
+# Reuse the ordinary session machinery rather than reimplementing the handoff.
+# It already gets teardown, recovery, the watchdog and session restore right,
+# and those are the parts that must not be duplicated badly.
+systemctl start --no-block "xsync-session@${XSYNC_MAINTENANCE_ID}.service" \
+    || die "could not start the maintenance session"
+
+log "maintenance session started; follow it with:"
+log "  journalctl -u xsync-session@${XSYNC_MAINTENANCE_ID}.service -f"

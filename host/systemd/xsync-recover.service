@@ -1,0 +1,30 @@
+[Unit]
+Description=xsync emergency recovery (restore GPU and host session)
+Documentation=https://github.com/brummiesteven/Xsync
+After=libvirtd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+Environment=XSYNC_ROOT=/var/lib/xsync/app
+ExecStart=/var/lib/xsync/app/host/bin/xsync-recover
+User=root
+# Longer than xsync-recover's own worst-case serial budget. At 180 it was
+# SIGTERMed part-way through the job it exists to do: flock 90 + vm.sh stop
+# 60+30 + kill 30 + reclaim/display 20 + session start 60 already exceeds it,
+# and a kill landing between the vfio unbind and the nvidia rebind leaves the
+# GPU on no driver -- the black TV this tool exists to repair.
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsync-recover
+
+# Deliberately NOT installable.
+#
+# This is a one-shot repair, invoked by ExecStopPost or by hand. With an
+# [Install] section `systemctl enable xsync-recover` is a natural thing to try,
+# and it would then run a full GPU unbind/rebind plus a display-manager restart
+# at every boot, ordered only After=libvirtd.service -- racing SDDM for the
+# card it is rebinding.

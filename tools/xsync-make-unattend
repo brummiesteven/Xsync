@@ -1,0 +1,212 @@
+#!/usr/bin/bash
+# xsync — build the unattended-install media.
+#
+#   tools/xsync-make-unattend [--out <path>] [--list-editions] [--dry-run]
+#
+# Windows setup scans removable drives for autounattend.xml, so the answer file
+# plus the guest scripts are packed into a small ISO and attached as a third
+# CD-ROM. That is simpler and far less fragile than repacking Microsoft's 7.9 GB
+# install media, and it keeps the original ISO untouched and re-usable.
+#
+# The resulting disc is mounted as F: in the guest, which is where the
+# FirstLogonCommands in autounattend.xml expect the scripts to be.
+
+set -uo pipefail
+
+XSYNC_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export XSYNC_ROOT
+source "$XSYNC_ROOT/host/bin/xsync-common.sh"
+
+OUT="${XSYNC_VM_STORAGE_DIR:-/var/lib/xsync}/iso/xsync-unattend.iso"
+DRY=0
+LIST=0
+
+while (( $# )); do
+    case "$1" in
+        --out)            OUT="$2"; shift 2 ;;
+        --list-editions)  LIST=1; shift ;;
+        --dry-run)        DRY=1; shift ;;
+        -h|--help)        sed -n '2,15p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+# ---------------------------------------------------------------- editions
+
+# Read edition names straight out of install.wim's XML metadata resource, so the
+# name in the answer file can be checked against what the ISO actually contains
+# instead of assumed. A mismatch makes setup fail with a very unhelpful message.
+list_editions() {
+    local iso="${XSYNC_WINDOWS_ISO}"
+    [[ -f "$iso" ]] || die "Windows ISO not found: $iso"
+    local mnt; mnt="$(mktemp -d)"
+    trap 'umount "$mnt" 2>/dev/null; rmdir "$mnt" 2>/dev/null' RETURN
+    mount -o loop,ro "$iso" "$mnt" 2>/dev/null || die "could not mount $iso (need root)"
+    python3 - "$mnt/sources/install.wim" <<'PY'
+import struct, sys, xml.etree.ElementTree as ET
+with open(sys.argv[1], 'rb') as f:
+    hdr = f.read(208)
+    off = 0x48
+    size = int.from_bytes(hdr[off:off+7], 'little')
+    offset = struct.unpack_from('<Q', hdr, off + 8)[0]
+    f.seek(offset)
+    txt = f.read(size).decode('utf-16-le', 'ignore').lstrip('﻿')
+    end = txt.rfind('</WIM>')
+    if end != -1:
+        txt = txt[:end+6]
+    for img in ET.fromstring(txt).findall('IMAGE'):
+        print(f"  {img.get('INDEX'):>3}  {img.findtext('NAME')}")
+PY
+}
+
+if (( LIST )); then
+    need_root
+    echo "Editions in $XSYNC_WINDOWS_ISO:"
+    list_editions
+    exit 0
+fi
+
+# ---------------------------------------------------------------- render
+
+[[ -f "$XSYNC_WINDOWS_ISO" ]] || warn "Windows ISO missing: $XSYNC_WINDOWS_ISO"
+[[ -f "$XSYNC_VIRTIO_ISO"  ]] || warn "virtio ISO missing: $XSYNC_VIRTIO_ISO"
+
+command -v xorriso >/dev/null 2>&1 \
+    || die "xorriso not found (brew install xorriso)"
+
+TMPL="$XSYNC_ROOT/guest/unattend/autounattend.xml"
+[[ -f "$TMPL" ]] || die "answer file template not found: $TMPL"
+
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+
+# Setup needs *a* key to know which edition to install. Omitting the element
+# entirely does not skip the question — it stops on the Product key screen
+# waiting for a human. So fall back to the generic edition-selection key, which
+# installs Pro unactivated.
+if [[ -n "${XSYNC_WINDOWS_KEY:-}" ]]; then
+    USE_KEY="$XSYNC_WINDOWS_KEY"
+    log "using the configured product key"
+else
+    USE_KEY="${XSYNC_WINDOWS_INSTALL_KEY:-VK7JG-NPHTM-C97JM-9MPGT-3V66T}"
+    log "no product key set — using the generic edition-selection key (installs unactivated)"
+fi
+KEY_BLOCK="        <ProductKey>
+          <Key>${USE_KEY}</Key>
+          <WillShowUI>Never</WillShowUI>
+        </ProductKey>"
+
+render() {
+    # Values are passed through the environment, never interpolated into the
+    # program text. Embedding them directly meant a config value containing a
+    # quote, backslash or newline could break the render or execute arbitrary
+    # Python as root. They are also XML-escaped, since a bare '&' or '<' would
+    # otherwise produce an answer file that only fails at the validity check.
+    XS_EDITION="$XSYNC_WINDOWS_EDITION" \
+    XS_USER="$XSYNC_GUEST_USER" \
+    XS_PASSWORD="$XSYNC_GUEST_PASSWORD" \
+    XS_HOSTNAME="$XSYNC_GUEST_HOSTNAME" \
+    XS_TIMEZONE="$XSYNC_TIMEZONE" \
+    XS_UILANG="$XSYNC_UI_LANGUAGE" \
+    XS_INPUTLOCALE="$XSYNC_INPUT_LOCALE" \
+    XS_SYSLOCALE="$XSYNC_SYSTEM_LOCALE" \
+    XS_USERLOCALE="$XSYNC_USER_LOCALE" \
+    XS_KEYBLOCK="$KEY_BLOCK" \
+    XS_TMPL="$TMPL" \
+    python3 <<'PY'
+import os, sys
+from xml.sax.saxutils import escape
+
+def env(name):
+    return escape(os.environ.get(name, ''))
+
+repl = {
+    '@WINDOWS_EDITION@':   env('XS_EDITION'),
+    '@USERNAME@':          env('XS_USER'),
+    '@PASSWORD@':          env('XS_PASSWORD'),
+    '@COMPUTER_NAME@':     env('XS_HOSTNAME'),
+    '@OWNER@':             env('XS_USER'),
+    '@TIMEZONE@':          env('XS_TIMEZONE'),
+    '@UI_LANGUAGE@':       env('XS_UILANG'),
+    '@INPUT_LOCALE@':      env('XS_INPUTLOCALE'),
+    '@SYSTEM_LOCALE@':     env('XS_SYSLOCALE'),
+    '@USER_LOCALE@':       env('XS_USERLOCALE'),
+    # Already XML; it is generated by this script, not user free-text.
+    '@PRODUCT_KEY_BLOCK@': os.environ.get('XS_KEYBLOCK', ''),
+}
+
+s = open(os.environ['XS_TMPL']).read()
+for k, v in repl.items():
+    s = s.replace(k, v)
+missing = [t for t in repl if t in s]
+if missing:
+    sys.exit('unsubstituted tokens: ' + ', '.join(missing))
+sys.stdout.write(s)
+PY
+}
+
+log "rendering answer file"
+render >"$STAGE/autounattend.xml" || die "failed to render the answer file"
+
+# Verify before burning it into an ISO: a malformed answer file is silently
+# ignored by Windows setup, which then sits waiting for input nobody can give.
+python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse('$STAGE/autounattend.xml')" \
+    || die "rendered answer file is not valid XML"
+log "answer file is valid XML"
+
+# Guest scripts are written with a UTF-8 BOM.
+#
+# This is not cosmetic. Windows PowerShell 5.1 — which is what runs in the guest —
+# decodes a BOM-less .ps1 as Windows-1252, not UTF-8. A UTF-8 em dash (E2 80 94)
+# then becomes "â€”", and that trailing character is U+201D, which PowerShell
+# treats as a string delimiter. The result is a parse error somewhere *after* the
+# real problem, with no hint as to the cause. pwsh 7 on Linux assumes UTF-8 and
+# parses the same file happily, so this does not show up in host-side checks.
+for f in xsync-firstboot.ps1 xsync-agent.ps1 xsync-debloat.ps1 xsync-provision.ps1 xsync-appearance.ps1 xsync-fse.ps1; do
+    src="$XSYNC_ROOT/guest/agent/$f"
+    [[ -f "$src" ]] || die "missing guest script: $src"
+    printf '\xEF\xBB\xBF' >"$STAGE/$f"
+    cat "$src" >>"$STAGE/$f"
+done
+# Firstboot runs inside the guest, off this disc, with no way to read the
+# host's config. A marker on the disc is how the setting crosses over.
+if [[ "${XSYNC_ENABLE_FSE:-1}" == "1" ]]; then
+    : >"$STAGE/fse.enabled"
+    log "Xbox Full Screen Experience will be enabled on first boot"
+else
+    log "Xbox Full Screen Experience disabled by config"
+fi
+
+log "staged answer file + $(ls "$STAGE"/*.ps1 | wc -l) guest scripts (UTF-8 BOM)"
+
+# Cheap guard against the above regressing.
+for f in "$STAGE"/*.ps1; do
+    [[ "$(head -c 3 "$f" | xxd -p)" == "efbbbf" ]] || die "missing UTF-8 BOM: $f"
+done
+
+if (( DRY )); then
+    log "dry run — staged contents:"
+    ls -la "$STAGE"
+    exit 0
+fi
+
+mkdir -p "$(dirname "$OUT")"
+log "building $OUT"
+xorriso -as mkisofs -J -R -V XSYNC_UA -o "$OUT" "$STAGE" >/dev/null 2>&1 \
+    || die "xorriso failed"
+
+# This ISO contains the guest account password and the Windows key in
+# cleartext -- autounattend.xml uses <PlainText>true</PlainText>, because
+# Windows Setup requires it. World-readable is therefore wrong: any local
+# account could read the guest's admin password straight off disk.
+#
+# 0640 root:qemu keeps QEMU able to open it while nobody else can.
+chmod 0640 "$OUT"
+if ! chown root:qemu "$OUT" 2>/dev/null; then
+    # Debian/Ubuntu call the user libvirt-qemu. Fall back rather than leaving
+    # it owned by whoever ran the script.
+    chown root:libvirt-qemu "$OUT" 2>/dev/null \
+        || warn "could not set ownership on $OUT — check libvirt can read it"
+fi
+chmod 0750 "$(dirname "$OUT")" 2>/dev/null || true
+log "created $OUT ($(du -h "$OUT" | cut -f1)), mode 0640 (contains credentials)"

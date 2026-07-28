@@ -1,0 +1,147 @@
+#!/usr/bin/bash
+# xsync — restore gaming mode when the TV comes back.
+#
+# Why this exists:
+#
+# The reference machine drives a TV, not a monitor. When the HDMI signal drops —
+# which it does every time the GPU is handed to the VM, and again when it is
+# handed back — the TV can drop to standby. A TV in standby stops answering on
+# the DDC lines, so the connector reads "disconnected" with a 0-byte EDID and the
+# NVIDIA driver reports "Cannot find any crtc or sizes".
+#
+# gamescope cannot start without an output. When it fails, SteamOS's session
+# logic rewrites /etc/sddm.conf.d/zz-steamos-autologin.conf to the Plasma
+# one-shot session, so the machine settles on the desktop. The user then switches
+# the TV on and finds KDE instead of Big Picture, with no obvious way back.
+#
+# NVIDIA registers no CEC adapter (only amdgpu and i915 do), so the TV cannot be
+# woken from software. All that can be done is notice the moment it returns and
+# put gaming mode back.
+#
+# Runs as a system service; polls cheaply; does nothing while things are healthy.
+
+set -uo pipefail
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/xsync-common.sh"
+
+BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+POLL="${XSYNC_DISPLAY_POLL:-10}"
+
+# Prefer a connector that is actually connected, and only fall back to the
+# first one that exists.
+#
+# Returning the first HDMI port regardless of status is wrong on any GPU with
+# more than one: the watcher would read a permanently-disconnected connector,
+# decide the display is gone forever, and stop the display manager and never
+# start it again. The reference 4090 exposes exactly one HDMI port, so this was
+# invisible here and would have been a black screen on somebody else's machine.
+connector() {
+    local card c first=""
+    card="$(basename "$(readlink -f "/sys/bus/pci/devices/$XSYNC_GPU_PCI/drm/card"* 2>/dev/null | head -1)" 2>/dev/null)"
+    [[ -n "$card" ]] || return 1
+    for c in "/sys/class/drm/${card}"-*; do
+        [[ -e "$c/status" ]] || continue
+        [[ -n "$first" ]] || first="$c"
+        if [[ "$(cat "$c/status" 2>/dev/null)" == "connected" ]]; then
+            echo "$c"; return 0
+        fi
+    done
+    [[ -n "$first" ]] && { echo "$first"; return 0; }
+    return 1
+}
+
+display_connected() {
+    local c; c="$(connector)" || return 1
+    [[ "$(cat "$c/status" 2>/dev/null)" == "connected" ]]
+}
+
+gamescope_up() { pgrep -x gamescope-wl >/dev/null 2>&1; }
+
+# Don't fight a handoff: while a play session holds the lock, the VM owns the
+# GPU and the host is *supposed* to have no session.
+handoff_active() {
+    ! flock -n 9 2>/dev/null
+} 9>"$XSYNC_STATE_DIR/session.lock"
+
+log "display watch started (polling every ${POLL}s)"
+
+was_connected=unknown
+# Only restore a session this watcher took away. Set when it stops the display
+# manager, cleared once it has put it back.
+we_stopped_it=0
+# Consecutive failed restore attempts. Without a ceiling, a genuinely broken
+# gamescope (say a bad driver reload) turns this into an unbreakable ~90s
+# restart loop that also clears Bazzite's short-session tracker every pass -
+# defeating the very mechanism that would otherwise drop the user to a usable
+# desktop.
+restore_failures=0
+MAX_RESTORE_FAILURES="${XSYNC_MAX_RESTORE_FAILURES:-3}"
+
+while true; do
+    sleep "$POLL"
+
+    if handoff_active; then
+        continue
+    fi
+
+    if display_connected; then
+        if [[ "$was_connected" != "yes" ]]; then
+            log "display came back"
+            was_connected=yes
+        fi
+
+        # Never fight a deliberate choice.
+        #
+        # "display connected and gamescope not running" is also exactly what
+        # `steamos-session-select desktop` looks like. Acting on that alone
+        # meant the watcher killed the user's KDE session within ten seconds
+        # and rewrote autologin back to gaming mode - making desktop mode
+        # unreachable for as long as this enabled-by-default service ran.
+        if ! gamescope_up && (( we_stopped_it )); then
+            if (( restore_failures >= MAX_RESTORE_FAILURES )); then
+                : # already given up; logged once below
+            else
+                log "display is back and this watcher had stopped the session — restoring"
+                # A nudge is not enough: SteamOS may have pinned the desktop session.
+                "$BIN/session.sh" stop  >/dev/null 2>&1 || true
+                sleep 2
+                if "$BIN/session.sh" start; then
+                    log "gaming mode restored"
+                    we_stopped_it=0
+                    restore_failures=0
+                else
+                    restore_failures=$(( restore_failures + 1 ))
+                    error "could not restore gaming mode (attempt $restore_failures/$MAX_RESTORE_FAILURES)"
+                    if (( restore_failures >= MAX_RESTORE_FAILURES )); then
+                        error "giving up; leaving the display manager alone so the desktop stays reachable"
+                    fi
+                fi
+                # Give the session time to settle before evaluating again.
+                sleep 30
+            fi
+        fi
+    else
+        if [[ "$was_connected" != "no" ]]; then
+            log "display is gone (TV off or in standby) — waiting for it to return"
+            was_connected=no
+        fi
+
+        # Stop the display manager while there is nothing to draw on.
+        #
+        # Left running, sddm keeps retrying the session, gamescope fails every
+        # time for want of an output, and each failure adds a line to Bazzite's
+        # short-session tracker. Five entries and SteamOS decides Steam is broken
+        # and pins the desktop session — so an evening with the TV switched off
+        # would leave gaming mode disabled by morning.
+        #
+        # Nothing is lost by stopping it: this watcher brings the session back
+        # the moment the display returns.
+        if systemctl is-active "$XSYNC_DISPLAY_MANAGER" >/dev/null 2>&1 && ! gamescope_up; then
+            log "no display and no session — stopping $XSYNC_DISPLAY_MANAGER until the TV returns"
+            systemctl stop "$XSYNC_DISPLAY_MANAGER" 2>/dev/null || true
+            rm -f /tmp/chimeraos-short-session-tracker
+            we_stopped_it=1
+            restore_failures=0
+        fi
+    fi
+done

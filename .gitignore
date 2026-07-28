@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.iso
+*.raw
+*.part
+
+# Local configuration: holds an API key, the guest account password and
+# (optionally) a Windows product key. Ship the .example instead.
+config/xsync.conf

@@ -1,0 +1,241 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  xsync — Windows 11 unattended install answer file.
+
+  Rendered by tools/xsync-make-unattend, which substitutes @TOKENS@ and packs the
+  result into a small ISO. Windows setup scans removable media for
+  autounattend.xml, so attaching that ISO is all it takes.
+
+  Two things here are load-bearing and easy to get wrong:
+
+  1. VIRTIO DRIVERS IN WINPE. The system disk is virtio-blk, which Windows setup
+     cannot see out of the box — without the DriverPaths below, the installer
+     reports "no drives found" and stops. The paths point at the virtio-win ISO
+     mounted as the second CD-ROM.
+
+  2. AUTOLOGON. The xsync guest agent draws the exit overlay and reads the
+     controller, neither of which work from a non-interactive service session. It
+     has to run in a real interactive desktop session, so Windows must log in on
+     its own with no keyboard attached to the TV.
+
+  Note this file contains no product key by default. Windows installs and runs
+  fine unactivated, and the Xbox app works regardless; activation is left to the
+  user rather than baked into a config file.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <settings pass="windowsPE">
+
+    <!-- Make the virtio storage driver available to the installer. -->
+    <component name="Microsoft-Windows-PnpCustomizationsWinPE"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <!--
+        CD-ROM drive letters are not deterministic in WinPE: they depend on how
+        many volumes the installer sees and in what order. Rather than guess,
+        every plausible letter is listed for each driver. Paths that don't exist
+        are skipped harmlessly, and the one that does exist wins.
+
+        viostor is the critical one — without it the installer sees no disks at
+        all and stops with "we couldn't find any drives".
+      -->
+      <DriverPaths>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="1" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>D:\viostor\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="2" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>E:\viostor\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="3" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>F:\viostor\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="4" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>G:\viostor\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="5" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>D:\NetKVM\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="6" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>E:\NetKVM\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="7" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>F:\NetKVM\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="8" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>E:\vioserial\w11\amd64</Path>
+        </PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="9" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Path>F:\vioserial\w11\amd64</Path>
+        </PathAndCredentials>
+      </DriverPaths>
+    </component>
+
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <SetupUILanguage><UILanguage>@UI_LANGUAGE@</UILanguage></SetupUILanguage>
+      <InputLocale>@INPUT_LOCALE@</InputLocale>
+      <SystemLocale>@SYSTEM_LOCALE@</SystemLocale>
+      <UILanguage>@UI_LANGUAGE@</UILanguage>
+      <UserLocale>@USER_LOCALE@</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+
+      <!-- GPT layout for UEFI: EFI system partition, MSR, then Windows. -->
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order><Type>EFI</Type><Size>512</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order><Type>MSR</Type><Size>128</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order><Type>Primary</Type><Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order><PartitionID>1</PartitionID>
+              <Label>System</Label><Format>FAT32</Format>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order><PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order><PartitionID>3</PartitionID>
+              <Label>Windows</Label><Format>NTFS</Format><Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+              <Key>/IMAGE/NAME</Key>
+              <Value>@WINDOWS_EDITION@</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <FullName>@OWNER@</FullName>
+        <Organization>xsync</Organization>
+@PRODUCT_KEY_BLOCK@
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <ComputerName>@COMPUTER_NAME@</ComputerName>
+      <!-- Nothing here is ever seen by a human; the guest only shows games. -->
+      <TimeZone>@TIMEZONE@</TimeZone>
+    </component>
+
+    <component name="Microsoft-Windows-Security-SPP-UX"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <SkipAutoActivation>true</SkipAutoActivation>
+    </component>
+
+    <!-- Remote Desktop is a useful escape hatch while the guest has no display
+         of its own (during install, before GPU passthrough is attached). -->
+    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <fDenyTSConnections>false</fDenyTSConnections>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+            <Name>@USERNAME@</Name>
+            <DisplayName>@USERNAME@</DisplayName>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>@PASSWORD@</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <!-- LogonCount is deliberately large: the agent needs an interactive
+           session on every boot, not just the first few. -->
+      <AutoLogon>
+        <Username>@USERNAME@</Username>
+        <Enabled>true</Enabled>
+        <LogonCount>999999</LogonCount>
+        <Password>
+          <Value>@PASSWORD@</Value>
+          <PlainText>true</PlainText>
+        </Password>
+      </AutoLogon>
+
+      <!--
+        One command, not six. Drive letters are unreliable, so rather than
+        hardcoding them the bootstrap locates the xsync disc by its volume label
+        (XSYNC_UA) and hands off to xsync-firstboot.ps1, which discovers the
+        virtio disc the same way and sequences the rest of the setup itself.
+        Keeping the ordering logic in PowerShell also means it can log failures
+        somewhere readable instead of vanishing into Windows setup.
+      -->
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Order>1</Order>
+          <Description>xsync first-boot setup</Description>
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$v = Get-Volume -FileSystemLabel 'XSYNC_UA' -ErrorAction SilentlyContinue; if ($v) { &amp; \"$($v.DriveLetter):\xsync-firstboot.ps1\" } else { foreach ($d in 'D','E','F','G','H') { if (Test-Path \"${d}:\xsync-firstboot.ps1\") { &amp; \"${d}:\xsync-firstboot.ps1\"; break } } }"</CommandLine>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS">
+      <InputLocale>@INPUT_LOCALE@</InputLocale>
+      <SystemLocale>@SYSTEM_LOCALE@</SystemLocale>
+      <UILanguage>@UI_LANGUAGE@</UILanguage>
+      <UserLocale>@USER_LOCALE@</UserLocale>
+    </component>
+  </settings>
+</unattend>

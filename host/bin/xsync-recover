@@ -1,0 +1,122 @@
+#!/usr/bin/bash
+# xsync — emergency recovery.
+#
+#   sudo systemctl start xsync-recover.service     (the passwordless, always-available route)
+#   sudo /var/lib/xsync/app/host/bin/xsync-recover  (direct; not on PATH)
+#
+# Unconditionally returns the machine to a usable state: kills the VM, forces the
+# GPU back to the host driver, and restarts the display manager. Run this over SSH
+# if the TV is black and Steam has not come back.
+#
+# Also wired to OnFailure= of xsync-session@.service, so it runs automatically if
+# the orchestrator dies in a way it could not handle itself.
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/xsync-common.sh"
+
+BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+need_root
+
+# Serialise against a live handoff. Without this, recovery and the session it is
+# recovering can reclaim the GPU concurrently, racing each other's unbind/probe.
+# Waits rather than failing: recovery must always eventually run.
+exec 9>"$XSYNC_STATE_DIR/session.lock"
+if ! flock -w 90 9; then
+    # Someone still holds it after 90s. Before barging in, find out WHO.
+    #
+    # This unconditionally proceeded, and that turned a correctly-rejected second
+    # launch into a weapon against the first. Launching game B while game A is
+    # running makes B die on this very lock -- correct -- but systemd then runs
+    # ExecStopPost= for B's instance, which is this script. It timed out, pushed
+    # past the lock, saw phase=RUNNING and a live VM, and shut down A's guest
+    # mid-game while reclaiming the GPU concurrently with A's own reclaim: the
+    # exact race the lock exists to prevent.
+    #
+    # A live session unit means the lock holder is healthy and owns the cleanup,
+    # so there is nothing here to recover. Only a lock with no session behind it
+    # is stale, and that is the case worth forcing past.
+    if session_unit_live; then
+        log "another xsync session is active and holds the lock — it owns its own cleanup, nothing to recover"
+        exit 0
+    fi
+    warn "timed out waiting for the session lock, but no session unit is active — proceeding (stale lock)"
+fi
+
+log "=== xsync-recover: forcing the host back to a usable state ==="
+log "phase at time of recovery: $(get_phase)"
+
+# Do nothing when there is demonstrably nothing to recover.
+#
+# ExecStopPost= fires on success as well as failure, so this ran a full GPU
+# unbind/rebind after every CLEAN session -- writing to PCI driver-binding
+# sysfs during the most fragile sixty seconds of the cycle, while gamescope was
+# coming up on that very card, and re-running the autologin rewrite for nothing.
+#
+# Being idle is not enough on its own: a wedged session can also look idle. All
+# three conditions together mean the machine is genuinely healthy.
+if [[ "${1:-}" != "--force" ]]; then
+    _phase="$(get_phase)"
+    _gpu="$("$BIN/gpu.sh" bound 2>/dev/null || echo unknown)"
+    # Require the video function to actually be on the host driver, not merely
+    # "not on vfio-pci". A GPU bound to no driver used to satisfy this test,
+    # which meant the one tool that exists to fix a black TV declined to run in
+    # precisely that state -- and said "already healthy" while it did so.
+    _drv="$(pci_driver "$XSYNC_GPU_PCI")"
+    if [[ "$_phase" == "IDLE" ]] \
+        && [[ "$_gpu" == "host" ]] \
+        && [[ "$_drv" == "$XSYNC_GPU_HOST_DRIVER" ]] \
+        && "$BIN/vm.sh" gone \
+        && systemctl is-active "$XSYNC_DISPLAY_MANAGER" >/dev/null 2>&1 \
+        && pgrep -x gamescope-wl >/dev/null 2>&1; then
+        log "host is already healthy (phase IDLE, GPU on host, VM off, $XSYNC_DISPLAY_MANAGER up, gamescope running) — nothing to do"
+        exit 0
+    fi
+    log "recovery needed (phase=$_phase gpu=$_gpu driver=$_drv)"
+fi
+
+# 1. The VM must be *gone* — not merely "not running". A paused, crashed or
+#    still-shutting-down domain keeps the GPU mapped through vfio, and unbinding
+#    it underneath a live QEMU wedges the card until a reboot.
+if ! "$BIN/vm.sh" gone; then
+    log "VM present (state: $("$BIN/vm.sh" state)) — stopping it"
+    "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || warn "could not stop the VM"
+else
+    log "VM is off"
+fi
+
+# 2. GPU back to the host — but only if nothing still owns it.
+if "$BIN/vm.sh" gone; then
+    "$BIN/gpu.sh" reclaim || error "GPU reclaim incomplete — attempting session restore anyway"
+else
+    error "VM will not die; NOT unbinding the GPU (that would make things worse)"
+    error "kill it manually: virsh --connect qemu:///system destroy $XSYNC_VM_NAME"
+fi
+
+# 3. Session back. This is the bit the user actually notices.
+#
+# "sddm is active" is not the same as "the user can see Steam". sddm stays
+# active while autologin lands somewhere else entirely -- a Plasma session, or a
+# gamescope that died on startup -- and testing only the display manager meant
+# recovery declared victory over a TV showing the wrong thing, or nothing.
+# gamescope is what actually renders Big Picture, so require it.
+if systemctl is-active "$XSYNC_DISPLAY_MANAGER" >/dev/null 2>&1 \
+   && pgrep -x gamescope-wl >/dev/null 2>&1; then
+    log "$XSYNC_DISPLAY_MANAGER running with gamescope up"
+else
+    if systemctl is-active "$XSYNC_DISPLAY_MANAGER" >/dev/null 2>&1; then
+        log "$XSYNC_DISPLAY_MANAGER is active but gamescope is not — restarting the session"
+        "$BIN/session.sh" stop || true
+    fi
+    "$BIN/session.sh" start || error "could not bring the gaming session back"
+fi
+
+set_phase IDLE
+
+echo
+echo "--- state after recovery ---"
+"$BIN/gpu.sh" status
+"$BIN/session.sh" status
+"$BIN/vm.sh" status
+echo
+
+log "=== xsync-recover finished ==="

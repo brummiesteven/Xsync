@@ -1,0 +1,19 @@
+[Unit]
+Description=xsync display watch (restore gaming mode when the TV returns)
+Documentation=https://github.com/brummiesteven/Xsync
+After=multi-user.target
+
+[Service]
+Type=simple
+Environment=XSYNC_ROOT=/var/lib/xsync/app
+ExecStart=/var/lib/xsync/app/host/bin/xsync-display-watch
+User=root
+Restart=always
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsync-display-watch
+
+[Install]
+WantedBy=multi-user.target

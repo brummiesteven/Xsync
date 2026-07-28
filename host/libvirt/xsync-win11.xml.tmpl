@@ -1,0 +1,137 @@
+<!--
+  xsync — Windows 11 guest.
+
+  Rendered by tools/xsync-setup; @TOKENS@ are substituted from config/xsync.conf.
+  Three profiles are produced from this one template:
+
+    install  virtio GPU + VNC, install media attached — Windows installs
+             without touching the TV, so the host session is undisturbed
+    maint    virtio GPU + VNC, boots the installed system, no install media —
+             for servicing the guest (settings, screenshots, inspection)
+             without taking the GPU or the TV away from the host
+    play     RTX 4090 + Xbox dongle passed through, no virtual display —
+             the guest drives the TV directly
+
+  Note on hypervisor visibility: xsync does NOT hide KVM from the guest.
+  <kvm><hidden/> and spoofed vendor IDs exist to defeat anti-cheat VM detection,
+  which this project deliberately does not do. Modern NVIDIA drivers (465+) no
+  longer throw Code 43 in a VM, so hiding buys nothing legitimate here.
+  The Hyper-V enlightenments below are a different thing entirely — they are
+  paravirtual performance hints that Windows expects, not concealment.
+-->
+<domain type='kvm'>
+  <name>@NAME@</name>
+  <metadata>
+    <xsync:profile xmlns:xsync='https://github.com/xsync/xsync'>@PROFILE@</xsync:profile>
+  </metadata>
+
+  <memory unit='KiB'>@RAM_KIB@</memory>
+  <currentMemory unit='KiB'>@RAM_KIB@</currentMemory>
+
+  <vcpu placement='static'>@VCPUS@</vcpu>
+  <!-- One dedicated I/O thread, pinned to the host CCD alongside the emulator so
+       disk work never lands on a core a game thread is using. Must be declared
+       before <cputune> can pin it. -->
+  <iothreads>1</iothreads>
+  <cputune>
+@CPUTUNE@
+  </cputune>
+
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <firmware>
+      <feature enabled='yes' name='enrolled-keys'/>
+      <feature enabled='yes' name='secure-boot'/>
+    </firmware>
+@BOOT@
+@BOOTMENU@
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+    <!-- Required for Secure Boot. -->
+    <smm state='on'/>
+    <!-- Paravirtual hints Windows uses to schedule and idle efficiently. -->
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+      <vpindex state='on'/>
+      <synic state='on'/>
+      <stimer state='on'/>
+      <frequencies state='on'/>
+      <tlbflush state='on'/>
+      <ipi state='on'/>
+    </hyperv>
+    <vmport state='off'/>
+  </features>
+
+  <!-- host-passthrough gives the guest the real 7950X feature set. -->
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' cores='@CORES@' threads='2'/>
+    <cache mode='passthrough'/>
+    <feature policy='require' name='topoext'/>
+  </cpu>
+
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <pm>
+    <!-- The host controls the VM's lifetime; the guest must not suspend itself
+         mid-session and strand the GPU. -->
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <!-- Game storage. raw + none/native is the fastest safe combination. -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='native' discard='unmap' iothread='1' queues='4'/>
+      <source file='@DISK@'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+@INSTALL_MEDIA@
+
+    <controller type='usb' model='qemu-xhci' ports='15'/>
+    <controller type='pci' model='pcie-root'/>
+    <controller type='virtio-serial'/>
+
+    <interface type='network'>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+
+    <!-- Control channel. Everything xsync tells the guest goes through here:
+         launch a game, enumerate the library, liveness. -->
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+
+    <!-- Windows 11 requires TPM 2.0. -->
+    <tpm model='tpm-crb'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+
+@GRAPHICS@
+
+@HOSTDEVS@
+
+    <!-- Ballooning causes frame pacing hitches; the VM gets a fixed allocation. -->
+    <memballoon model='none'/>
+
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>

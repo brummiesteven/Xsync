@@ -1,0 +1,672 @@
+#!/usr/bin/bash
+# xsync — end-to-end test harness.
+#
+#   sudo tools/xsync-test list
+#   sudo tools/xsync-test run <name>...
+#   sudo tools/xsync-test run all
+#   sudo tools/xsync-test run safe        (only non-disruptive tests)
+#
+# Tests are grouped by how much they disturb the machine:
+#
+#   safe        read-only or self-contained; the TV keeps showing Steam
+#   disruptive  stops the Steam session and/or moves the GPU; the TV blanks
+#
+# Every disruptive test asserts the machine is left in a usable state
+# afterwards, because "it worked but the TV never came back" is a failure.
+
+set -uo pipefail
+
+XSYNC_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export XSYNC_ROOT
+source "$XSYNC_ROOT/host/bin/xsync-common.sh"
+
+BIN="$XSYNC_ROOT/host/bin"
+PASS=0; FAIL=0
+declare -a FAILURES=()
+
+ok()   { printf '    \033[32m✓\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
+bad()  { printf '    \033[31m✗\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILURES+=("$*"); }
+info() { printf '      %s\n' "$*"; }
+head_() { printf '\n\033[1m[%s]\033[0m %s\n' "$1" "$2"; }
+
+assert_eq() {
+    local want="$1" got="$2" what="$3"
+    [[ "$got" == "$want" ]] && ok "$what ($got)" || bad "$what: expected '$want', got '$got'"
+}
+
+# The invariant that matters most: after anything, the host must be usable.
+assert_host_healthy() {
+    local ctx="$1"
+    local gpu; gpu="$("$BIN/gpu.sh" bound)"
+    [[ "$gpu" == "host" ]] && ok "$ctx: GPU owned by host" || bad "$ctx: GPU is '$gpu', expected 'host'"
+
+    local drv; drv="$(pci_driver "$XSYNC_GPU_PCI")"
+    [[ "$drv" == "$XSYNC_GPU_HOST_DRIVER" ]] \
+        && ok "$ctx: $XSYNC_GPU_PCI on $drv" \
+        || bad "$ctx: $XSYNC_GPU_PCI on '$drv', expected '$XSYNC_GPU_HOST_DRIVER'"
+
+    systemctl is-active "$XSYNC_DISPLAY_MANAGER" >/dev/null 2>&1 \
+        && ok "$ctx: display manager active" || bad "$ctx: display manager is not active"
+
+    "$BIN/vm.sh" gone && ok "$ctx: VM is off" || bad "$ctx: VM is '$("$BIN/vm.sh" state)'"
+}
+
+wait_for_session() {
+    local waited=0
+    while (( waited < 120 )); do
+        pgrep -u "$XSYNC_USER" -x steam >/dev/null 2>&1 && return 0
+        sleep 3; waited=$((waited+3))
+    done
+    return 1
+}
+
+# Wait until the host is genuinely back: GPU returned, VM gone, display manager
+# up. This is the invariant every disruptive test depends on, and it is the only
+# thing worth waiting for -- unit states lie about it, because a session unit is
+# "deactivating" for the entire duration of ExecStopPost, which is where much of
+# the recovery actually happens.
+RECOVERY_WAITED=0
+wait_for_recovery() {
+    local limit="${1:-240}"
+    RECOVERY_WAITED=0
+    while (( RECOVERY_WAITED < limit )); do
+        if [[ "$("$BIN/gpu.sh" bound)" == "host" ]] \
+           && "$BIN/vm.sh" gone \
+           && systemctl is-active "$XSYNC_DISPLAY_MANAGER" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 5; RECOVERY_WAITED=$((RECOVERY_WAITED+5))
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------- safe tests
+
+# Guest scripts must be pure ASCII, and this must be checked mechanically.
+#
+# Windows PowerShell 5.1 decodes a BOM-less file as Windows-1252, so a UTF-8
+# em dash (E2 80 94) becomes three characters ending in U+201D -- which closes
+# a double-quoted string. The delivery paths add a BOM, but when that failed
+# once the symptom was not an error: the parser resynchronised on the next
+# mangled dash and silently swallowed fifteen lines of code, including a
+# `return`, into a single string token. A wrong program that runs.
+#
+# Keeping the sources ASCII removes the dependency on the BOM entirely.
+test_guest_ascii() {
+    head_ safe "guest scripts are pure ASCII"
+    local f found=0
+    for f in "$XSYNC_ROOT"/guest/agent/*.ps1; do
+        [[ -f "$f" ]] || continue
+        found=1
+        if LC_ALL=C grep -q '[^ -~	]' "$f"; then
+            bad "$(basename "$f") contains non-ASCII: $(LC_ALL=C grep -n '[^ -~	]' "$f" | head -1 | cut -c1-60)"
+        else
+            ok "$(basename "$f") is ASCII"
+        fi
+    done
+    (( found )) || bad "no guest scripts found under $XSYNC_ROOT/guest/agent"
+}
+
+test_config() {
+    head_ safe "configuration and tooling"
+    [[ -r "$XSYNC_CONF" ]] && ok "config readable" || bad "config unreadable"
+    for f in gpu.sh session.sh vm.sh guest.sh library.py xsync-session xsync-recover xsync-launch; do
+        [[ -x "$BIN/$f" ]] && ok "$f executable" || bad "$f is NOT executable"
+    done
+    systemctl cat xsync-session@.service >/dev/null 2>&1 \
+        && ok "systemd template installed" || bad "systemd template missing"
+    [[ -r /etc/sudoers.d/xsync ]] && ok "sudoers rule present" || bad "sudoers rule missing"
+}
+
+test_gpu_state() {
+    head_ safe "GPU ownership reporting"
+    assert_eq host "$("$BIN/gpu.sh" bound)" "GPU reports as host-owned at rest"
+    # An absent iommu_group must fail, not pass with a count of zero.
+    #
+    # Without -r, xargs still ran basename with no argument, so grp was empty,
+    # the ls failed, members was 0, and (( 0 <= 2 )) printed a green tick reading
+    # "IOMMU group  isolated (0 devices)". IOMMU is this project's first stated
+    # prerequisite and this is the safe suite's only coverage of it -- so a
+    # machine with IOMMU disabled in firmware, or a mistyped short-form PCI
+    # address, got "All assertions passed".
+    local grp members
+    grp="$(readlink -f "/sys/bus/pci/devices/$XSYNC_GPU_PCI/iommu_group" 2>/dev/null | xargs -r basename)"
+    if [[ -z "$grp" || ! -d "/sys/kernel/iommu_groups/$grp/devices" ]]; then
+        bad "no IOMMU group for $XSYNC_GPU_PCI — IOMMU disabled in firmware, or the address is wrong"
+        return
+    fi
+    members=$(ls "/sys/kernel/iommu_groups/$grp/devices/" 2>/dev/null | wc -w)
+    (( members >= 1 )) || { bad "IOMMU group $grp lists no devices"; return; }
+    (( members <= 2 )) && ok "IOMMU group $grp isolated ($members devices)" \
+                       || bad "IOMMU group $grp has $members devices"
+}
+
+test_vm_state_semantics() {
+    head_ safe "libvirt state semantics"
+    # The bug this guards: treating anything other than "shut off" as gone, then
+    # reclaiming the GPU from under a live QEMU.
+    "$BIN/vm.sh" defined && ok "domain defined" || bad "domain not defined"
+    local st; st="$("$BIN/vm.sh" state)"
+    info "current state: $st"
+    if [[ "$st" == "shut off" ]]; then
+        "$BIN/vm.sh" gone && ok "'shut off' reported as gone" || bad "'shut off' not reported as gone"
+    elif [[ "$st" == "running" ]]; then
+        "$BIN/vm.sh" gone && bad "'running' wrongly reported as gone" || ok "'running' correctly not gone"
+        "$BIN/vm.sh" alive && ok "'running' reported as alive" || bad "'running' not reported as alive"
+    fi
+
+    # An unreadable state must never be reported as gone.
+    #
+    # vm_state used to collapse every virsh failure into "undefined", which
+    # vm_gone treats as gone -- so a libvirtd restart, a socket hiccup or a
+    # permissions change handed out permission to unbind the GPU from under a
+    # live QEMU. That is the single most expensive thing this codebase can get
+    # wrong, and nothing tested for it.
+    #
+    # Simulate it with a virsh that always fails, shadowing the real one on PATH.
+    # Breaking PATH wholesale would break the script itself and prove nothing;
+    # this isolates the single dependency under test.
+    local shim
+    shim="$(mktemp -d)"
+    cat >"$shim/virsh" <<'SHIM'
+#!/bin/bash
+echo "error: failed to connect to the hypervisor" >&2
+exit 1
+SHIM
+    chmod +x "$shim/virsh"
+
+    local shim_state
+    shim_state="$(PATH="$shim:$PATH" "$BIN/vm.sh" state 2>/dev/null)"
+    if [[ "$shim_state" == "unknown" ]]; then
+        ok "an unreachable libvirt reports state 'unknown'"
+    else
+        bad "an unreachable libvirt reported state '$shim_state' (expected 'unknown')"
+    fi
+
+    if PATH="$shim:$PATH" "$BIN/vm.sh" gone >/dev/null 2>&1; then
+        bad "an unreachable libvirt was reported as GONE — the GPU could be unbound under a live VM"
+    else
+        ok "an unreachable libvirt is not reported as gone"
+    fi
+
+    rm -rf "$shim"
+}
+
+test_sudoers_no_wildcard() {
+    head_ safe "sudoers grants no wildcard"
+    # sudoers(5): "Because command line arguments are matched as a single,
+    # concatenated string, a wildcard can match multiple arguments." The rule
+    # used to be `systemctl start --no-block xsync-session@*.service`, and the *
+    # spanned a space -- so appending a second unit name started ANY unit as
+    # root, passwordless. It was demonstrated on this machine before being fixed.
+    local f=/etc/sudoers.d/xsync
+    if [[ ! -r "$f" ]]; then bad "cannot read $f"; return; fi
+    if grep -vE '^\s*#' "$f" | grep -q '[*?]'; then
+        bad "sudoers drop-in contains a wildcard — it can span a space and swallow extra arguments"
+        grep -vE '^\s*#' "$f" | grep '[*?]' | while read -r l; do info "$l"; done
+    else
+        ok "no wildcards in the sudoers drop-in"
+    fi
+
+    # And the shim that replaced it must reject anything but a clean id.
+    local shim="$BIN/xsync-start-session"
+    if [[ ! -x "$shim" ]]; then bad "xsync-start-session missing"; return; fi
+    local rejected=0 total=0 bad_id
+    for bad_id in 'x.service other.service' 'a b' '../../etc' 'x@y' 'x;reboot' ''; do
+        total=$((total+1))
+        "$shim" "$bad_id" >/dev/null 2>&1 || rejected=$((rejected+1))
+    done
+    (( rejected == total )) \
+        && ok "shim rejected all $total malformed ids" \
+        || bad "shim accepted $((total-rejected)) of $total malformed ids"
+}
+
+test_session_unit_live() {
+    head_ safe "live-session detection"
+    # xsync-session@.service is Type=oneshot with RemainAfterExit=no, so a running
+    # instance reports ActiveState=activating for its whole life and is NEVER
+    # "active". A --state=active query returns nothing at every point in a
+    # session -- which silently disabled BOTH the guard that stops xsync-recover
+    # tearing down a live game and the guard that stops uninstall deleting the
+    # running orchestrator. Both were written today and both were dead code.
+    #
+    # Prove the predicate against a real oneshot unit rather than trusting it.
+    local u=xsync-selftest-oneshot
+    systemctl stop "$u" >/dev/null 2>&1; systemctl reset-failed "$u" >/dev/null 2>&1
+    systemd-run --no-block --unit="$u" --service-type=oneshot \
+        -p RemainAfterExit=no /usr/bin/sleep 8 >/dev/null 2>&1 || { bad "could not start a probe unit"; return; }
+    sleep 2
+
+    local st
+    st="$(systemctl show "$u" -p ActiveState --value 2>/dev/null)"
+    [[ "$st" == "activating" ]] \
+        && ok "a running oneshot reports ActiveState=$st (not 'active')" \
+        || info "probe unit reported ActiveState=$st"
+
+    if systemctl list-units "${u}.service" --state=active --no-legend 2>/dev/null | grep -q .; then
+        info "--state=active matched (this systemd differs; predicate still fine)"
+    else
+        ok "--state=active does NOT match it — the old predicate was dead code"
+    fi
+
+    if systemctl list-units "${u}.service" --state=active,activating --no-legend 2>/dev/null | grep -q .; then
+        ok "--state=active,activating DOES match it"
+    else
+        bad "--state=active,activating failed to match a live oneshot unit"
+    fi
+
+    # Drive the REAL function, through its unit pattern.
+    #
+    # The first version of this test asserted against inline `systemctl
+    # list-units --state=...` strings and only ever called session_unit_live
+    # after the probe was stopped -- so reverting the predicate to --state=active
+    # left every assertion passing. A regression net for a bug that has already
+    # recurred twice, that could not catch it.
+    if session_unit_live "${u}.service"; then
+        ok "session_unit_live sees a live oneshot unit"
+    else
+        bad "session_unit_live did NOT see a live oneshot unit — the predicate is wrong again"
+    fi
+
+    systemctl stop "$u" >/dev/null 2>&1; systemctl reset-failed "$u" >/dev/null 2>&1
+    session_unit_live "${u}.service" && bad "session_unit_live true after the unit stopped" \
+                      || ok "session_unit_live false once it is gone"
+}
+
+test_library_roundtrip() {
+    head_ safe "shortcuts.vdf codec"
+    python3 - <<'PY'
+import importlib.util, os, tempfile, sys
+from pathlib import Path
+os.environ.setdefault('XSYNC_ROOT', '/var/lib/xsync/app')
+spec = importlib.util.spec_from_file_location('lib', os.environ['XSYNC_ROOT'] + '/host/bin/library.py')
+lib = importlib.util.module_from_spec(spec); spec.loader.exec_module(lib)
+fails = 0
+
+# Truncation and zero-fill must RAISE, never parse as a short library.
+#
+# The old reader treated end-of-buffer as end-of-map, so a shortcuts.vdf
+# truncated by a power cut during Steam's own write parsed "successfully" with
+# fewer entries -- and cmd_sync writes that back as authoritative, permanently
+# deleting the user's hand-made shortcuts. A zero-filled file was worse: 0x00 is
+# the begin-map tag and an empty key is legal, so N nul bytes parsed as N/2
+# nested empty maps and returned [] with no exception at all.
+good = None
+with tempfile.TemporaryDirectory() as d2:
+    p2 = Path(d2) / 'shortcuts.vdf'
+    lib.write_shortcuts(p2, [lib.make_shortcut(g) for g in
+                             [{'id': 'x', 'name': 'X'}, {'id': 'y', 'name': 'Y'}, {'id': 'z', 'name': 'Z'}]])
+    good = p2.read_bytes()
+    silent = 0
+    for cut in range(1, len(good)):
+        p2.write_bytes(good[:cut])
+        try:
+            if len(lib.read_shortcuts(p2)) != 3:
+                silent += 1
+        except Exception:
+            pass
+    if silent:
+        print(f'    truncated VDF parsed as a short library at {silent} offset(s)'); fails += 1
+    zsilent = 0
+    for n in (2, 16, 64, 512, 1998):
+        p2.write_bytes(b'\x00' * n)
+        try:
+            lib.read_shortcuts(p2); zsilent += 1
+        except Exception:
+            pass
+    if zsilent:
+        print(f'    zero-filled VDF silently accepted at {zsilent} size(s)'); fails += 1
+    p2.write_bytes(good)
+    if len(lib.read_shortcuts(p2)) != 3:
+        print('    a VALID file no longer parses'); fails += 1
+
+games = [{'id': 'a-game', 'name': "Tom's Game & Co <ultra>"}, {'id': 'b', 'name': 'B'}]
+scs = [lib.make_shortcut(g) for g in games]
+with tempfile.TemporaryDirectory() as d:
+    p = Path(d) / 'shortcuts.vdf'
+    lib.write_shortcuts(p, scs)
+    back = lib.read_shortcuts(p)
+    if len(back) != len(scs): print('    MISMATCH count'); fails += 1
+    for a, b in zip(scs, back):
+        if a['AppName'] != b['AppName'] or a['appid'] != b['appid']:
+            print(f'    MISMATCH {a["AppName"]}'); fails += 1
+    # An unparseable file must raise, not silently return empty - returning
+    # empty would delete every hand-made shortcut on the next write.
+    p.write_bytes(b'\x99garbage\x00')
+    try:
+        lib.read_shortcuts(p)
+        print('    corrupt file did NOT raise'); fails += 1
+    except lib.ShortcutsUnreadable:
+        pass
+sys.exit(1 if fails else 0)
+PY
+    [[ $? -eq 0 ]] && ok "VDF round-trip + corruption guard" || bad "VDF codec problems"
+}
+
+test_launch_validation() {
+    head_ safe "game id validation"
+    # A private directory, not a shared /tmp path: touching /tmp/pwned as root
+    # follows symlinks, so the test itself was a small local vulnerability.
+    local d; d="$(mktemp -d)"
+    local canary="$d/pwned"
+    local out rc
+    out="$("$BIN/xsync-launch" "bad;id\$(touch $canary)" 2>&1)"; rc=$?
+
+    # Assert on all three: no side effect, a non-zero exit, and the specific
+    # rejection. Checking only for the canary proved nothing about rejection --
+    # it passed whenever that one payload happened not to fire, including if the
+    # id had been accepted and a handoff started.
+    [[ -e "$canary" ]] && bad "command injection via game id!" || ok "no side effect from a malicious id"
+    (( rc != 0 )) && ok "malformed game id rejected (exit $rc)" || bad "malformed game id was ACCEPTED (exit 0)"
+    grep -q 'invalid game id' <<<"$out" && ok "rejection message correct" \
+        || bad "expected 'invalid game id' in output, got: $(head -c 120 <<<"$out")"
+    rm -rf "$d"
+}
+
+test_concurrency_guard() {
+    head_ safe "concurrent handoff lock"
+
+    # Take the lock in *this* shell and confirm we actually hold it before
+    # going anywhere near xsync-session.
+    #
+    # The previous version backgrounded a subshell that exited if it could not
+    # take the lock, then ran `xsync-session xbox-app` one second later
+    # regardless. If the lock had not been taken, that was not a test at all --
+    # it was a real handoff: display manager stopped, GPU moved, VM booted, from
+    # a test categorised "safe".
+    exec 8>"$XSYNC_STATE_DIR/session.lock"
+    if ! flock -n 8; then
+        bad "could not acquire the session lock — skipping (is a session running?)"
+        exec 8>&-
+        return
+    fi
+    ok "test holds the session lock"
+
+    local out; out="$("$BIN/xsync-session" xbox-app 2>&1 || true)"
+    if grep -q 'another xsync session is already running' <<<"$out"; then
+        ok "second session refused while lock held"
+    else
+        bad "second session was NOT refused"
+        info "$(echo "$out" | tail -2)"
+    fi
+
+    flock -u 8
+    exec 8>&-
+}
+
+# ------------------------------------------------------------ disruptive
+
+test_session_cycle() {
+    head_ disruptive "session teardown and restore (no GPU move)"
+    "$BIN/session.sh" stop || bad "session stop failed"
+    sleep 2
+    systemctl is-active "$XSYNC_DISPLAY_MANAGER" >/dev/null 2>&1 \
+        && bad "display manager still active after stop" || ok "session stopped"
+    "$BIN/session.sh" start || bad "session start failed"
+    wait_for_session && ok "Steam came back" || bad "Steam did not come back within 90s"
+    assert_host_healthy "after session cycle"
+}
+
+test_gpu_cycle() {
+    head_ disruptive "GPU release and reclaim (no VM)"
+    # Proves the rebinding works in isolation, before trusting it with a VM.
+    "$BIN/session.sh" stop || bad "session stop failed"
+    sleep 2
+    if "$BIN/gpu.sh" release; then
+        ok "GPU released to vfio-pci"
+        assert_eq vfio-pci "$("$BIN/gpu.sh" bound)" "GPU bound to vfio-pci"
+    else
+        bad "GPU release failed"
+    fi
+    if "$BIN/gpu.sh" reclaim; then
+        ok "GPU reclaimed"
+    else
+        bad "GPU reclaim failed"
+    fi
+    assert_eq host "$("$BIN/gpu.sh" bound)" "GPU back to host"
+    assert_eq "$XSYNC_GPU_HOST_DRIVER" "$(pci_driver "$XSYNC_GPU_PCI")" "video function on host driver"
+    "$BIN/session.sh" start || bad "session start failed"
+    wait_for_session && ok "Steam came back" || bad "Steam did not come back"
+    assert_host_healthy "after GPU cycle"
+}
+
+test_recover_from_released_gpu() {
+    head_ disruptive "xsync-recover from a GPU stuck on vfio-pci"
+    # Simulates a session that died after releasing the GPU but before starting
+    # the VM - the state that leaves a black TV if recovery is broken.
+    "$BIN/session.sh" stop || bad "session stop failed"
+    sleep 2
+    "$BIN/gpu.sh" release || bad "could not set up the stuck state"
+    assert_eq vfio-pci "$("$BIN/gpu.sh" bound)" "GPU deliberately stuck on vfio-pci"
+    "$BIN/xsync-recover" >/dev/null 2>&1 || info "recover returned non-zero"
+    wait_for_session && ok "recover restored the session" || bad "recover did NOT restore the session"
+    assert_host_healthy "after recover"
+}
+
+test_full_handoff() {
+    head_ disruptive "full handoff: launch, run, exit, restore"
+    local target="${XSYNC_TEST_GAME:-xbox-app}"
+    info "launching '$target' via the systemd unit (as Steam would)"
+    systemctl start --no-block "xsync-session@${target}.service"
+
+    # Wait for the VM to come up.
+    local waited=0
+    while (( waited < 180 )); do
+        "$BIN/vm.sh" alive && break
+        sleep 5; waited=$((waited+5))
+    done
+    "$BIN/vm.sh" alive && ok "VM started (${waited}s)" || { bad "VM never started"; return; }
+
+    assert_eq vfio-pci "$("$BIN/gpu.sh" bound)" "GPU handed to the VM"
+
+    # Wait for the guest to be reachable, then confirm something is on screen.
+    "$BIN/guest.sh" wait 180 >/dev/null 2>&1 && ok "guest agent reachable" || bad "guest never answered"
+
+    # Wait for the SESSION to reach RUNNING before shutting the guest down.
+    #
+    # Both this test and the session poll the guest agent independently, and
+    # this test used to shut the guest down as soon as *it* got an answer. If
+    # the session was still inside `guest.sh wait` at that moment, the agent it
+    # was waiting for went away for good, so the session had to sit out its
+    # full 120s timeout before it could recover -- and the test then failed
+    # every subsequent assertion for a system that was recovering perfectly
+    # well, just not yet. Observed directly: recovery completed 20s after the
+    # test had already given up on it.
+    waited=0
+    while (( waited < 240 )); do
+        [[ "$(get_phase 2>/dev/null)" == "RUNNING" ]] && break
+        sleep 5; waited=$((waited+5))
+    done
+    [[ "$(get_phase 2>/dev/null)" == "RUNNING" ]] \
+        && ok "session reached RUNNING (${waited}s)" \
+        || bad "session never reached RUNNING (phase: $(get_phase 2>/dev/null))"
+
+    info "requesting shutdown to exercise the exit path"
+    "$BIN/guest.sh" shutdown >/dev/null 2>&1 || true
+
+    waited=0
+    while (( waited < 300 )); do
+        "$BIN/vm.sh" gone && break
+        sleep 5; waited=$((waited+5))
+    done
+    "$BIN/vm.sh" gone && ok "VM shut down (${waited}s)" || bad "VM did not shut down"
+
+    # Recovery is not instant: the VM being gone is the START of the teardown,
+    # not the end of it.
+    #
+    # Do NOT wait on the unit's state. `systemctl is-active` returns non-zero
+    # for "deactivating", and the unit stays deactivating for the whole time
+    # ExecStopPost=xsync-recover is doing the actual recovery -- so a check for
+    # "not active" breaks out immediately and judges a host that is still
+    # halfway through being put back together. That is precisely what made this
+    # test report a broken machine that was in fact recovering normally.
+    #
+    # Wait for the conditions the test genuinely cares about instead.
+    wait_for_recovery && info "host recovered after ${RECOVERY_WAITED}s" \
+                      || bad "host did not recover within ${RECOVERY_WAITED}s"
+
+    wait_for_session && ok "Steam session restored" || bad "Steam did not come back"
+    assert_host_healthy "after full handoff"
+}
+
+test_watchdog_kill() {
+    head_ disruptive "watchdog: VM destroyed mid-session"
+    systemctl start --no-block "xsync-session@xbox-app.service"
+    local waited=0
+    while (( waited < 180 )); do
+        "$BIN/vm.sh" alive && break
+        sleep 5; waited=$((waited+5))
+    done
+    "$BIN/vm.sh" alive || { bad "VM never started"; return; }
+    ok "VM up; simulating a hard failure"
+
+    # The nastiest realistic case: QEMU dies without the orchestrator being told.
+    virsh --connect qemu:///system destroy "$XSYNC_VM_NAME" >/dev/null 2>&1 || true
+
+    waited=0
+    while (( waited < 240 )); do
+        pgrep -u "$XSYNC_USER" -x steam >/dev/null 2>&1 && break
+        sleep 5; waited=$((waited+5))
+    done
+    wait_for_session && ok "session recovered after hard kill (${waited}s)" \
+                     || bad "session did NOT recover after hard kill"
+    assert_host_healthy "after watchdog kill"
+}
+
+# ---------------------------------------------------------------- driver
+
+SAFE_TESTS=(test_config test_guest_ascii test_gpu_state test_vm_state_semantics test_sudoers_no_wildcard test_session_unit_live test_library_roundtrip
+            test_launch_validation test_concurrency_guard)
+DISRUPTIVE_TESTS=(test_session_cycle test_gpu_cycle test_recover_from_released_gpu
+                  test_full_handoff)
+
+# Deliberately NOT in DISRUPTIVE_TESTS, so `run all` does not include it.
+#
+# test_watchdog_kill destroys a running VM to prove the host recovers -- and the
+# host does, every time. But the GUEST does not come away clean. Repeatedly
+# hard-killing this VM during one afternoon produced, in order: an nvlddmkm GPU
+# fault that made a game render at about 1fps, a Windows Startup Repair screen
+# on the next boot, and finally NTFS-level corruption severe enough that DISM
+# could not even scan the component store (error 1392) and Windows Update could
+# no longer install anything.
+#
+# "The host recovers cleanly" is not the same as "this is harmless". Run it
+# deliberately, on a guest you are willing to rebuild:
+#
+#   sudo tools/xsync-test run watchdog_kill --yes
+DESTRUCTIVE_TESTS=(test_watchdog_kill)
+
+case "${1:-list}" in
+    list)
+        echo "safe:"; printf '  %s\n' "${SAFE_TESTS[@]#test_}"
+        echo "disruptive:"; printf '  %s\n' "${DISRUPTIVE_TESTS[@]#test_}"
+        ;;
+    run)
+        need_root
+        shift
+        ASSUME_YES=0
+        declare -a args=()
+        for arg in "$@"; do
+            case "$arg" in
+                -y|--yes|--disruptive) ASSUME_YES=1 ;;
+                *) args+=("$arg") ;;
+            esac
+        done
+        set -- "${args[@]:-}"
+
+        declare -a to_run=()
+        for arg in "$@"; do
+            [[ -n "$arg" ]] || continue
+            case "$arg" in
+                all)        to_run+=("${SAFE_TESTS[@]}" "${DISRUPTIVE_TESTS[@]}") ;;
+                safe)       to_run+=("${SAFE_TESTS[@]}") ;;
+                disruptive) to_run+=("${DISRUPTIVE_TESTS[@]}") ;;
+                *)          to_run+=("test_$arg") ;;
+            esac
+        done
+        (( ${#to_run[@]} )) || { echo "nothing to run" >&2; exit 64; }
+
+        # Anything disruptive tears down the Steam session, moves the GPU and
+        # blanks the TV. That must never happen because someone typed a name
+        # slightly wrong, and it must not happen silently to whoever is using
+        # the machine at the time.
+        want_disruptive=0
+        for t in "${to_run[@]}"; do
+            for d in "${DISRUPTIVE_TESTS[@]}"; do
+                [[ "$t" == "$d" ]] && want_disruptive=1
+            done
+        done
+
+        for t in "${to_run[@]}"; do
+            for d in "${DESTRUCTIVE_TESTS[@]}"; do
+                if [[ "$t" == "$d" ]]; then
+                    echo
+                    echo "WARNING: ${t#test_} hard-kills the running VM."
+                    echo "The host recovers, but the GUEST can be left damaged: this has"
+                    echo "previously caused GPU driver faults, Startup Repair, and component"
+                    echo "store corruption that blocked Windows Update entirely."
+                    echo "Only run it on a guest you are prepared to rebuild."
+                    echo
+                fi
+            done
+        done
+
+        if (( want_disruptive )) && (( ! ASSUME_YES )); then
+            echo
+            echo "These tests stop the Steam session, hand the GPU to the VM and blank the TV:"
+            for t in "${to_run[@]}"; do
+                for d in "${DISRUPTIVE_TESTS[@]}"; do
+                    [[ "$t" == "$d" ]] && echo "  ${t#test_}"
+                done
+            done
+            echo
+            if [[ ! -t 0 ]]; then
+                echo "Refusing to run disruptive tests without a terminal. Pass --yes if you are sure." >&2
+                exit 64
+            fi
+            read -r -p "Type 'yes' to continue: " reply
+            [[ "$reply" == "yes" ]] || { echo "aborted"; exit 0; }
+        fi
+
+        # An interrupt between session teardown and GPU reclaim leaves the GPU
+        # on vfio-pci with no display manager -- a black TV reachable only over
+        # SSH. Recover on any abnormal exit.
+        if (( want_disruptive )); then
+            trap 'echo; echo "interrupted — running xsync-recover"; "$BIN/xsync-recover" --force || true; exit 130' INT TERM
+        fi
+        for t in "${to_run[@]}"; do
+            if declare -F "$t" >/dev/null; then
+                # Let the previous test settle. Back-to-back disruptive tests
+                # otherwise start while the last session's unit is still in a
+                # failed state and the display manager is mid-restart, which
+                # fails the next launch for reasons that have nothing to do with
+                # what is being tested.
+                systemctl reset-failed 'xsync-session@*' 2>/dev/null || true
+
+                # Wait for any previous session to be genuinely finished, not
+                # merely for a fixed nap. A disruptive test starting while the
+                # last one is still reclaiming the GPU fails for reasons that
+                # have nothing to do with what it is testing -- which is exactly
+                # how the watchdog test reported "VM never started" against a
+                # host that was mid-recovery.
+                if ! wait_for_recovery 240; then
+                    bad "host was still not healthy ${RECOVERY_WAITED}s after the previous test"
+                elif (( RECOVERY_WAITED > 0 )); then
+                    info "waited ${RECOVERY_WAITED}s for the previous test to settle"
+                fi
+                sleep 5
+                "$t"
+            else
+                bad "no such test: ${t#test_}"
+            fi
+        done
+        printf '\n\033[1mResult:\033[0m %d passed, %d failed\n' "$PASS" "$FAIL"
+        if (( FAIL )); then
+            printf '\033[31mFailures:\033[0m\n'
+            printf '  - %s\n' "${FAILURES[@]}"
+            exit 1
+        fi
+        printf '\033[32mAll assertions passed.\033[0m\n'
+        ;;
+    *) echo "usage: $0 {list|run <name|safe|disruptive|all>...}" >&2; exit 64 ;;
+esac

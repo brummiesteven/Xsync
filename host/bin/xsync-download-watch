@@ -1,0 +1,156 @@
+#!/usr/bin/bash
+# xsync — keep a Game Pass download alive after the user has quit.
+#
+#   xsync-download-watch          (started by xsync-session; not run by hand)
+#
+# THE PROBLEM
+#
+# Somebody opens the Xbox app from Steam, starts installing Call of Duty at
+# 300 GB, and quits back to Steam — because nobody sits in front of a black TV
+# for two hours. Every exit path then powered the guest off and threw the
+# download away. Nothing in the watcher or the host looked at transfers at all:
+# it watched the Xbox app process and processes under C:\XboxGames, and a
+# download is done by GamingServices, which is neither.
+#
+# THE SHAPE OF THE FIX
+#
+# A download needs network and disk. It does not need the GPU. So the user gets
+# their TV back immediately on the normal path, and the guest comes back up
+# headless on the maint profile to finish the job:
+#
+#   quit -> GPU returns to host -> Steam restored (user is done, ~16s)
+#        -> guest restarts on maint, no passthrough, download resumes
+#        -> download finishes -> library synced -> guest powers off
+#
+# Store downloads resume across a reboot on their own, so the restart costs
+# progress rather than losing it.
+#
+# WHY STEAM HAS TO BE RESTARTED AT THE END
+#
+# Steam reads shortcuts.vdf at startup and rewrites it on exit, so a shortcut
+# added while Steam is running is discarded. Making the finished game appear
+# therefore needs a Steam session restart, which is ~15s back to Big Picture.
+# It is deliberately deferred while a game is running: interrupting somebody
+# mid-race to show them a new library entry would be a poor trade.
+
+set -uo pipefail
+
+BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+source "$BIN/xsync-common.sh"
+
+need_root
+
+POLL="${XSYNC_DOWNLOAD_POLL:-120}"
+MAX="${XSYNC_DOWNLOAD_MAX_SECONDS:-43200}"   # 12h: enough for a 300 GB title
+
+# Never fight a real session for the GPU.
+#
+# If the user launches a game while a download is finishing in the background,
+# that session owns the machine. Take the lock non-blockingly and give up
+# quietly rather than racing it.
+exec 9>"$XSYNC_STATE_DIR/download.lock"
+if ! flock -n 9; then
+    log "another download watcher is already running — nothing to do"
+    exit 0
+fi
+
+log "=== background download watcher started ==="
+
+# The guest must be up, headless, and not holding the GPU.
+if session_unit_live; then
+    log "a play session is active — the download will be picked up when it ends"
+    exit 0
+fi
+
+if ! "$BIN/vm.sh" gone; then
+    log "VM still present (state: $("$BIN/vm.sh" state)) — refusing to start a second one"
+    exit 0
+fi
+
+log "bringing the guest up headless on the maint profile"
+"$XSYNC_ROOT/tools/xsync-setup" vm maint >/dev/null 2>&1 \
+    || { error "could not define the maint profile"; exit 1; }
+"$BIN/vm.sh" start >/dev/null 2>&1 \
+    || { error "could not start the guest"; exit 1; }
+
+if ! "$BIN/guest.sh" wait 600; then
+    error "guest never became reachable — stopping it again"
+    "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || true
+    exit 1
+fi
+
+start="$(date +%s)"
+deadline=$(( start + MAX ))
+idle_polls=0
+
+while (( $(date +%s) < deadline )); do
+    # A user-initiated session takes priority over a background download.
+    if session_unit_live; then
+        log "a play session started — standing down"
+        exit 0
+    fi
+
+    if "$BIN/guest.sh" downloading >/dev/null 2>&1; then
+        idle_polls=0
+    else
+        # Require two consecutive quiet polls. A single one can land between two
+        # files, or during the pause while an installer commits what it has
+        # already fetched.
+        idle_polls=$(( idle_polls + 1 ))
+        if (( idle_polls >= 2 )); then
+            log "download finished after $(( ($(date +%s) - start) / 60 )) minute(s)"
+            break
+        fi
+    fi
+    sleep "$POLL"
+done
+
+if (( $(date +%s) >= deadline )); then
+    warn "download watcher hit its ${MAX}s ceiling — shutting the guest down anyway"
+fi
+
+# Capture the library BEFORE shutting the guest down: enumeration needs the agent.
+#
+# Same shape as capture_games in xsync-session, including the CRLF strip and the
+# array check -- the guest emits CRLF and may prepend blank lines, and without
+# the grep the captured file starts with a stray newline and every later parse
+# of it fails.
+tmp="$XSYNC_STATE_DIR/games.json.new"
+dest="$XSYNC_VM_STORAGE_DIR/games.json"
+if "$BIN/guest.sh" games 2>/dev/null | tr -d '\r' | grep -m1 '^\[' >"$tmp" \
+   && [[ -s "$tmp" ]] && jq -e 'type == "array"' <"$tmp" >/dev/null 2>&1 \
+   && (( $(jq 'length' <"$tmp") > 0 )); then
+    mv -f "$tmp" "$dest"
+    log "captured $(jq 'length' <"$dest") installed game(s)"
+else
+    rm -f "$tmp"
+    warn "could not enumerate games - the new title may not appear until the next session"
+fi
+
+log "shutting the guest down"
+"$BIN/guest.sh" shutdown >/dev/null 2>&1 || true
+sleep 30
+"$BIN/vm.sh" alive && { "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || true; }
+
+# Put the domain back on play, so the next launch is a normal handoff.
+"$XSYNC_ROOT/tools/xsync-setup" vm play >/dev/null 2>&1 \
+    || warn "could not restore the play profile"
+
+# Make the finished game visible.
+#
+# Steam has to be restarted for a new shortcut to appear, so only do it when
+# nobody is mid-game. If they are, the sync happens at the end of that session
+# anyway and this would only interrupt them.
+if session_unit_live; then
+    log "a session started while finishing up — leaving the library sync to it"
+    exit 0
+fi
+
+log "syncing the Steam library"
+"$BIN/session.sh" stop >/dev/null 2>&1 || true
+if ! "$BIN/library.py" sync; then
+    warn "library sync failed — the game is installed but may not appear yet"
+fi
+"$BIN/session.sh" start || error "could not bring the gaming session back"
+
+log "=== background download watcher finished ==="

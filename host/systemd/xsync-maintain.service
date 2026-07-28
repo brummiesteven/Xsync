@@ -1,0 +1,17 @@
+[Unit]
+Description=xsync guest maintenance (driver and guest updates)
+Documentation=https://github.com/brummiesteven/Xsync
+After=libvirtd.service
+Wants=libvirtd.service
+
+[Service]
+Type=oneshot
+Environment=XSYNC_ROOT=/var/lib/xsync/app
+ExecStart=/var/lib/xsync/app/host/bin/xsync-maintain
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsync-maintain
+
+# Deliberately NOT installable on its own. The timer below is what schedules it;
+# enabling the service directly would run maintenance once at every boot, which
+# is both pointless and badly timed.

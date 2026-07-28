@@ -1,0 +1,698 @@
+#!/usr/bin/bash
+# xsync — the handoff orchestrator.
+#
+#   xsync-session <game-id>
+#
+# Run by xsync-session@<game-id>.service, i.e. as a *system* unit, so it survives
+# the destruction of the user session it is about to tear down. Never invoke this
+# directly from inside the Steam session — use xsync-launch.
+#
+# Contract: however this exits, the host session comes back. A black TV with no
+# way back is the one unacceptable outcome, so correctness of the failure paths
+# matters more than anything else here.
+#
+# Error handling notes, because this is subtle and was wrong once:
+#   * `set -E` is required or the ERR trap is NOT inherited by shell functions,
+#     which silently reduces the whole error path to dead code.
+#   * `trap ... EXIT` is the real safety net: it fires on every exit, including
+#     ones no ERR trap sees. Recovery must not depend on reaching the end of a
+#     specific code path.
+#   * A flock guarantees only one handoff exists at a time. Without it two Steam
+#     launches race, both tear down the session, and both reclaim the GPU
+#     concurrently.
+
+set -Eeuo pipefail
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/xsync-common.sh"
+
+BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+GAME_ID="${1:-}"
+
+# systemd passes the instance name; treat "xbox-app" / empty as "boot to the
+# Xbox app rather than a specific game".
+[[ "$GAME_ID" == "xbox-app" ]] && GAME_ID=""
+
+# Defence in depth: xsync-launch validates this too, but this process runs as
+# root and feeds the value to the guest, so re-check it here.
+if [[ -n "$GAME_ID" && ! "$GAME_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    die "refusing to act on malformed game id: $GAME_ID"
+fi
+
+RECOVERED=0
+# Whether this process has actually taken the host apart. Recovery is a no-op
+# until it has: see the reasoning in recover().
+DISMANTLED=0
+WATCHDOG_PID=""
+
+# Absolute ceiling on a play session. Nothing should ever hold the GPU forever;
+# if it does, the user has lost their desktop and needs it back more than they
+# need the game.
+: "${XSYNC_MAX_SESSION_SECONDS:=43200}"   # 12h
+
+# --------------------------------------------------------------- concurrency
+
+# Only one handoff at a time, enforced across processes.
+exec 9>"$XSYNC_STATE_DIR/session.lock"
+if ! flock -n 9; then
+    die "another xsync session is already running — refusing to start a second"
+fi
+
+# --------------------------------------------------------------- recovery
+
+stop_watchdog() {
+    if [[ -n "$WATCHDOG_PID" ]]; then
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+        wait "$WATCHDOG_PID" 2>/dev/null || true
+        WATCHDOG_PID=""
+    fi
+}
+
+stop_exit_monitor() {
+    if [[ -n "${EXIT_MONITOR_PID:-}" ]]; then
+        kill "$EXIT_MONITOR_PID" 2>/dev/null || true
+        wait "$EXIT_MONITOR_PID" 2>/dev/null || true
+        EXIT_MONITOR_PID=""
+    fi
+}
+
+# Host-side backstop for "the game has finished".
+#
+# The guest agent is *supposed* to notice the game exiting and shut Windows down.
+# Relying on that alone makes the whole design hinge on one process staying
+# alive inside the guest: if the watcher never spawns, is killed, or throws, the
+# VM keeps the GPU forever and the user never gets their desktop back. That is
+# the single worst outcome here, so the host checks independently.
+#
+# Deliberately conservative: a long grace period for the game to appear, and
+# several consecutive "not playing" readings before acting, so a slow load or a
+# dropped agent call cannot end a live session.
+start_exit_monitor() {
+    local grace="${XSYNC_GAME_START_GRACE:-180}"
+    local needed="${XSYNC_EXIT_CONFIRMATIONS:-3}"
+    (
+        # errexit OFF for the whole monitor, deliberately.
+        #
+        # This is a supervisory loop whose entire purpose is to still be running
+        # when something else has gone wrong, and it is backgrounded and never
+        # waited on — so if it dies it dies silently, with no log line and no
+        # exit status anywhere. Inheriting `set -e` made that a certainty rather
+        # than a risk: `(( misses++ ))` evaluates to 0 the first time it runs,
+        # which is an exit status of 1, which killed the subshell on its first
+        # "not playing" reading. The backstop against a VM holding the GPU
+        # forever was itself dead before it ever did anything.
+        #
+        # A transient virsh or guest-agent hiccup must not be fatal here either.
+        set +e
+        # Do not hold the session lock open in a child; an orphan keeps it after
+        # the parent is gone and blocks xsync-recover and the display watcher.
+        exec 9>&-
+
+        sleep "$grace"
+        misses=0
+        seen=0
+        recap=0
+        dlpoll=0
+        rm -f "$XSYNC_STATE_DIR/captured"
+
+        # /run survives between sessions, so a stale 1 from last night would
+        # start a download watcher for something that finished hours ago.
+        echo 0 >"$XSYNC_STATE_DIR/download-active" 2>/dev/null || true
+
+        # A game that never started must still end the session.
+        #
+        # This only acts on "not playing" once `seen` is 1, and `seen` requires a
+        # true `guest.sh playing`, which requires state that only a SUCCESSFUL
+        # launch writes. So when the launch fails -- a stale slug, or autologon
+        # broken by a Windows update -- the monitor polls forever with no
+        # deadline, the watchdog stays happy because the agent answers pings, and
+        # the VM holds the GPU behind a black TV until the 12h session ceiling.
+        #
+        # If nothing has ever been seen playing within this window, there is
+        # nothing to supervise and the session should end.
+        never_seen_deadline=$(( $(date +%s) + ${XSYNC_LAUNCH_GRACE:-300} ))
+
+        # Notice when Windows restarts underneath us, and re-arm.
+        #
+        # A guest reboot mid-session is NOT exotic: enabling Xbox mode requires
+        # one, so it is a likely first-run experience. It used to break the
+        # session in two ways at once.
+        #
+        # The watcher is started at logon by a scheduled task. On the new boot it
+        # reads state.json, sees a boot_id from BEFORE the restart, correctly
+        # rejects it as stale, and exits. Nothing ever restarts it, because only
+        # a launch action spawns a watcher and the host did its launch before the
+        # reboot. Result: the game runs with no exit overlay at all -- the Guide
+        # button and the View+Menu chord both dead, on a machine with no keyboard.
+        #
+        # Meanwhile the agent is unreachable for the length of the restart, which
+        # reads here as "not playing" and could end the session outright.
+        #
+        # Re-issuing the launch fixes both: it writes state for the CURRENT boot
+        # and spawns a fresh watcher.
+        boot_id_at_start="$("$BIN/guest.sh" boot-id 2>/dev/null)"
+        [[ -n "$boot_id_at_start" ]] && log "guest boot id: $boot_id_at_start"
+
+        while "$BIN/vm.sh" alive; do
+            if [[ -n "$boot_id_at_start" ]]; then
+                now_boot="$("$BIN/guest.sh" boot-id 2>/dev/null)"
+                if [[ -n "$now_boot" && "$now_boot" != "$boot_id_at_start" ]]; then
+                    warn "the guest restarted mid-session — re-arming the exit watcher"
+                    "$BIN/guest.sh" launch "$GAME_ID" >/dev/null 2>&1 \
+                        && log "watcher re-armed after guest restart" \
+                        || error "could not re-arm the watcher — the exit overlay will not work this session"
+                    boot_id_at_start="$now_boot"
+                    misses=0
+                fi
+            fi
+            if (( ! seen )) && (( $(date +%s) >= never_seen_deadline )); then
+                error "no game ever started within ${XSYNC_LAUNCH_GRACE:-300}s — ending the session"
+                "$BIN/guest.sh" shutdown >/dev/null 2>&1 || true
+                sleep 45
+                "$BIN/vm.sh" alive && { "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || true; }
+                break
+            fi
+            if "$BIN/guest.sh" playing >/dev/null 2>&1; then
+                seen=1
+                misses=0
+            elif (( seen )); then
+                # Only trust "stopped" once we have seen it running at least once.
+                misses=$(( misses + 1 ))
+
+                # Take the final game list on the FIRST sign the session ended,
+                # while the guest is provably still up.
+                #
+                # This is the capture that actually matters: it is the only one
+                # taken after the user has finished installing things. The launch
+                # capture predates the install and the teardown capture runs after
+                # the domain is gone. The guest is holding its shutdown open
+                # waiting for the marker we write back here, so this is a real
+                # window, not a race we are hoping to win.
+                if (( misses == 1 )); then
+                    if capture_games >/dev/null 2>&1; then
+                        log "final game list captured"
+                    else
+                        warn "could not take the final game list — the library may be stale"
+                    fi
+                    # Release the guest whether or not that worked. A failed
+                    # enumeration must not strand a VM holding the GPU.
+                    : >"$XSYNC_STATE_DIR/captured"
+                    "$BIN/guest.sh" push "$XSYNC_STATE_DIR/captured" \
+                        'C:\ProgramData\xsync\captured' >/dev/null 2>&1 || true
+                fi
+
+                if (( misses >= needed )); then
+                    log "game is no longer running — ending the session"
+                    "$BIN/guest.sh" shutdown >/dev/null 2>&1 || true
+                    sleep 45
+                    if "$BIN/vm.sh" alive; then
+                        warn "guest ignored the shutdown request — stopping the VM"
+                        "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || true
+                    fi
+                    break
+                fi
+            fi
+            # Re-capture the installed-game list periodically, while the guest
+            # is definitely still up.
+            #
+            # Capturing at teardown cannot work, and testing a full cycle is the
+            # only way to see it: the guest's watcher calls Stop-Computer the
+            # moment the game exits, so by the time the host reaches its teardown
+            # the agent is already gone -- "guest stopped answering" immediately
+            # followed by "could not re-enumerate games at teardown".
+            #
+            # It matters because installing a game is the single most common
+            # thing anyone does in a session, and the list written at the end
+            # decides what appears in Steam. Every three minutes costs one cheap
+            # enumeration and makes the list current however the session ends,
+            # including a guest that powers itself off without warning.
+            recap=$(( recap + 1 ))
+            if (( recap >= 12 )); then
+                recap=0
+                capture_games >/dev/null 2>&1 || true
+            fi
+
+            # Same problem as the re-capture above, same fix.
+            #
+            # Teardown asks the guest "are you still downloading?" to decide
+            # whether to bring it back headless and finish the job. That question
+            # was being asked AFTER `vm.sh wait` had already confirmed the domain
+            # was gone, so it went to a dead agent, failed, and the answer was
+            # always no. The background download watcher could therefore never
+            # start on the normal exit path -- a whole feature that had never
+            # once fired.
+            #
+            # Record the answer here instead, while the guest is demonstrably
+            # alive, and let teardown fall back to this when the live probe fails.
+            # On its own, faster cadence than the enumeration: somebody who starts
+            # a 300 GB install and quits two minutes later still deserves to have
+            # it finished.
+            dlpoll=$(( dlpoll + 1 ))
+            if (( dlpoll >= 4 )); then
+                dlpoll=0
+                if "$BIN/guest.sh" downloading >/dev/null 2>&1; then
+                    echo 1 >"$XSYNC_STATE_DIR/download-active" 2>/dev/null || true
+                else
+                    echo 0 >"$XSYNC_STATE_DIR/download-active" 2>/dev/null || true
+                fi
+            fi
+            sleep 15
+        done
+    ) &
+    EXIT_MONITOR_PID=$!
+    log "exit monitor started (pid $EXIT_MONITOR_PID, ${grace}s grace)"
+}
+
+# Guest maintenance, run with the GPU attached.
+#
+# Everything here is deliberately non-fatal: this is housekeeping, and a failed
+# driver update must not cost the user their desktop. The host is restored by
+# the normal path afterwards either way.
+run_maintenance() {
+    set_phase RUNNING
+    log "--- guest maintenance ---"
+
+    local gd='C:\ProgramData\xsync\xsync-gpu-driver.ps1'
+    local target="${XSYNC_NVIDIA_DRIVER_VERSION:-596.36}"
+
+    # Push the current scripts first, so maintenance is never run by a stale
+    # copy inside the guest -- which is exactly how a driver update silently did
+    # nothing once already.
+    local s
+    for s in xsync-gpu-driver.ps1 xsync-appearance.ps1 xsync-agent.ps1 xsync-perf.ps1 xsync-update.ps1; do
+        "$BIN/guest.sh" push "$XSYNC_ROOT/guest/agent/$s" "C:\\ProgramData\\xsync\\$s" \
+            >/dev/null 2>&1 || warn "could not push $s"
+    done
+
+    # PresentMon, if performance logging is wanted. Fetched in the guest rather
+    # than pushed: guest-file-write goes through base64 over the agent channel,
+    # which is fine for scripts and painful for binaries, and the guest's own
+    # network is considerably faster.
+    if [[ "${XSYNC_PERF_LOGGING:-1}" == "1" ]]; then
+        local pmurl="${XSYNC_PRESENTMON_URL:-https://github.com/GameTechDev/PresentMon/releases/download/v2.5.1/PresentMon-2.5.1-x64.exe}"
+        XSYNC_GUEST_EXEC_TIMEOUT=300 "$BIN/guest.sh" ps "
+            \$d='C:\ProgramData\xsync\PresentMon.exe'
+            if (Test-Path \$d) { 'PresentMon already present' }
+            else {
+                try {
+                    Import-Module BitsTransfer -EA SilentlyContinue
+                    Start-BitsTransfer -Source '$pmurl' -Destination \$d -EA Stop
+                    'PresentMon downloaded'
+                } catch { 'PresentMon download failed: ' + \$_.Exception.Message }
+            }" 2>&1 | tr -d '\r' | tail -1 | sed 's/^/  /' || true
+    fi
+
+    log "checking the GPU driver (target $target)"
+    if XSYNC_GUEST_EXEC_TIMEOUT=2400 "$BIN/guest.sh" exec powershell.exe \
+        -NoProfile -ExecutionPolicy Bypass -File "$gd" -Version "$target"; then
+        log "driver step completed"
+    else
+        warn "driver step reported problems — see C:\\ProgramData\\xsync\\gpu-driver.log"
+    fi
+
+    log "installed driver now: $(XSYNC_GUEST_EXEC_TIMEOUT=120 "$BIN/guest.sh" ps \
+        '(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch "Basic|VirtIO" } | ForEach-Object { $_.Name + " " + $_.DriverVersion }) -join "; "' \
+        2>/dev/null | tr -d '\r' | tail -1)"
+
+    log "maintenance done — shutting the guest down"
+    "$BIN/guest.sh" shutdown >/dev/null 2>&1 || true
+
+    # Wait for it, then let the normal teardown below reclaim the GPU.
+    local waited=0
+    while (( waited < 180 )) && "$BIN/vm.sh" alive; do
+        sleep 5
+        waited=$(( waited + 5 ))
+    done
+    "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || true
+
+    "$BIN/gpu.sh" reclaim || error "GPU reclaim reported problems"
+    set_phase SYNC_LIBRARY
+    sync_library || warn "library sync failed — continuing"
+    "$BIN/session.sh" start || error "display manager did not start"
+    set_phase IDLE
+    log "=== maintenance session finished ==="
+}
+
+# Bring the host back no matter what happened. Safe to call repeatedly.
+recover() {
+    (( RECOVERED )) && return 0
+    RECOVERED=1
+
+    # First, so neither can race the shutdown below with its own virsh destroy.
+    stop_watchdog
+    stop_exit_monitor
+
+    # Nothing was taken apart, so there is nothing to put back.
+    #
+    # The EXIT trap is armed before preflight runs, so every `die` in preflight
+    # lands here too — and recovery would then destroy a VM this process never
+    # started and had just refused to touch. The realistic victim is someone
+    # servicing the guest on the maint profile (which preflight explicitly
+    # rejects) who then bumps an xsync shortcut in Big Picture: the launch
+    # correctly refuses, and recovery kills their maintenance VM anyway.
+    #
+    # DISMANTLED is set the moment the host session is torn down, and only then.
+    if (( ! DISMANTLED )); then
+        log "nothing was dismantled — no recovery needed"
+        set_phase IDLE
+        return 0
+    fi
+
+    log "--- recovery: returning the host to a usable state ---"
+
+    # The VM must be *gone*, not merely "not running", before the GPU can be
+    # touched. A paused or shutting-down domain still has the card mapped.
+    if ! "$BIN/vm.sh" gone; then
+        log "VM still present (state: $("$BIN/vm.sh" state)) — stopping it"
+        "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || error "could not stop the VM"
+    fi
+
+    if "$BIN/vm.sh" gone; then
+        "$BIN/gpu.sh" reclaim || error "GPU reclaim reported problems — restoring session regardless"
+    else
+        error "VM will not die; NOT touching the GPU (unbinding now would wedge it)"
+    fi
+
+    "$BIN/session.sh" start || error "could not restart the display manager"
+
+    set_phase IDLE
+    log "--- recovery complete ---"
+}
+
+on_error() {
+    local code=$? line=$1
+    error "failed at line $line (exit $code) during phase $(get_phase)"
+    recover
+    exit "$code"
+}
+
+# EXIT is the real net: it catches every path out of this script, including ones
+# ERR never sees.
+trap 'on_error $LINENO' ERR
+trap 'recover' EXIT
+trap 'warn "interrupted"; recover; exit 130' INT TERM
+
+# --------------------------------------------------------------- preflight
+
+preflight() {
+    set_phase PREPARE
+
+    [[ "$XSYNC_MODE" == "handoff" ]] \
+        || die "XSYNC_MODE=$XSYNC_MODE is not implemented; expected 'handoff'"
+
+    # `vm.sh status` always exits 0 (it is an echo), so it can never be used as
+    # a guard. These subcommands return real exit statuses.
+    "$BIN/vm.sh" defined || die "VM '$XSYNC_VM_NAME' is not defined — run tools/xsync-setup vm play"
+
+    # The domain has to be on the *play* profile, not merely defined.
+    #
+    # install and maint boot the same disk with a virtio display and no
+    # passthrough. Starting one of those here would be silently ruinous: the
+    # host session gets torn down, the GPU is released, and the guest then comes
+    # up on a virtual display nobody can see — leaving a black TV, a running VM
+    # and no way back except the watchdog. Worth failing on, and failing *here*,
+    # before anything has been dismantled.
+    local domain_profile
+    domain_profile="$("$BIN/vm.sh" profile)"
+    if [[ -n "$domain_profile" && "$domain_profile" != "play" ]]; then
+        die "VM '$XSYNC_VM_NAME' is defined on the '$domain_profile' profile, which has no GPU passthrough — run: sudo tools/xsync-setup vm play"
+    fi
+    [[ -n "$domain_profile" ]] || warn "domain records no xsync profile — assuming play"
+
+    "$BIN/vm.sh" gone \
+        || die "VM is already present (state: $("$BIN/vm.sh" state)) — refusing to start a session"
+
+    local bound
+    bound="$("$BIN/gpu.sh" bound)"
+    case "$bound" in
+        host)     : ;;
+        vfio-pci) warn "GPU was already on vfio-pci — a previous session may not have cleaned up" ;;
+        partial)  warn "GPU functions split between vfio-pci and host drivers — release will fix this" ;;
+        *)        warn "unrecognised GPU ownership state '$bound' — continuing" ;;
+    esac
+
+    if lsusb -d "${XSYNC_DONGLE_VENDOR}:${XSYNC_DONGLE_PRODUCT}" >/dev/null 2>&1; then
+        log "Xbox dongle present"
+    elif [[ "${XSYNC_DONGLE_REQUIRED,,}" == "true" ]]; then
+        die "Xbox dongle ${XSYNC_DONGLE_VENDOR}:${XSYNC_DONGLE_PRODUCT} not present"
+    else
+        warn "Xbox dongle not detected — the VM will have no controller"
+    fi
+
+    log "preflight OK (game: ${GAME_ID:-<Xbox app>})"
+}
+
+# --------------------------------------------------------------- watchdog
+
+# Force the VM down if the guest stops answering.
+#
+# Liveness is "does the guest agent still reply" — the same channel used to
+# control it, so there is no separate heartbeat that can rot independently of
+# the thing it measures. Transient non-answers are normal under GPU load, so
+# this requires sustained silence measured in wall-clock, not poll counts (each
+# ping can itself block for up to the virsh timeout).
+start_watchdog() {
+    local deadline_secs="$XSYNC_HEARTBEAT_TIMEOUT"
+    (( deadline_secs < 15 )) && deadline_secs=15
+    (
+        # Same reasoning as the exit monitor: a supervisor that dies quietly is
+        # worse than useless, and it must not keep the session lock open.
+        set +e
+        exec 9>&-
+
+        silent_since=0
+        while "$BIN/vm.sh" alive; do
+            if "$BIN/guest.sh" ping >/dev/null 2>&1; then
+                silent_since=0
+            else
+                now=$(date +%s)
+                if (( silent_since == 0 )); then
+                    silent_since=$now
+                    warn "guest stopped answering"
+                elif (( now - silent_since >= deadline_secs )); then
+                    error "guest silent for $(( now - silent_since ))s — forcing shutdown"
+                    "$BIN/vm.sh" kill || true
+                    break
+                fi
+            fi
+            sleep 5
+        done
+    ) &
+    WATCHDOG_PID=$!
+    log "watchdog started (pid $WATCHDOG_PID, ${deadline_secs}s silence limit)"
+}
+
+# --------------------------------------------------------------- main
+
+main() {
+    log "=== xsync session starting (game: ${GAME_ID:-<Xbox app>}) ==="
+
+    preflight
+
+    # From here on the host is in pieces and recovery is obliged to run.
+    DISMANTLED=1
+    "$BIN/session.sh" stop
+    "$BIN/gpu.sh" release
+    "$BIN/vm.sh" start
+
+    # Windows must come up before it can be told what to do.
+    "$BIN/guest.sh" wait || die "guest never became reachable"
+
+    # An answering agent is not a usable desktop. The agent runs as Local
+    # System in session 0 and replies well before autologon completes, and a
+    # launch fired in that gap fails with "no interactive user is logged on"
+    # -- a warning only, so the session carries on and the user is left at the
+    # Xbox app with the game never started.
+    "$BIN/guest.sh" wait-user || warn "no interactive session — the launch will probably fail"
+
+    # Maintenance is a "game" only in the sense that Steam launches it.
+    #
+    # Driver updates need the GPU actually attached -- the NVIDIA installer
+    # refuses to install for a device that is not present -- so they cannot run
+    # on the maint profile and require a real handoff. Making that a Steam entry
+    # is the only way a Big Picture user can trigger it at all: there is no
+    # route from a gamepad to a Windows installer otherwise.
+    if [[ "$GAME_ID" == "$XSYNC_MAINTENANCE_ID" ]]; then
+        # Bounded, because this returns above start_watchdog and the session
+        # ceiling -- so the longest and riskiest guest path in the project was
+        # running with the host torn down, the GPU on vfio-pci and nothing
+        # supervising it at all. The NVIDIA installer bugchecking the guest
+        # mid-install is a routine outcome when replacing the driver of a
+        # passed-through card; QEMU then stays up holding the GPU behind a black
+        # TV, on a weekly timer that fires at 04:00 with nobody watching.
+        #
+        # Its own comment claimed this path "already gets the watchdog". It did
+        # not. A plain outer limit is the right shape here: long silences during
+        # a driver install are normal, so the heartbeat watchdog is not.
+        # Run it in a child so it inherits every helper and variable, and kill
+        # the child if it outlives the budget. `timeout` cannot be used directly
+        # on a shell function, and re-declaring it into a bare subshell would
+        # lose $BIN and the rest -- breaking maintenance rather than bounding it.
+        local _mt="${XSYNC_MAINTENANCE_TIMEOUT:-3600}"
+        run_maintenance &
+        local _mpid=$!
+        ( sleep "$_mt"; kill -TERM "$_mpid" 2>/dev/null ) &
+        local _wpid=$!
+        # Every wait here must be errexit-proof.
+        #
+        # This script runs under `set -Eeuo pipefail` with an ERR trap, and
+        # `wait` on a SIGTERM-killed child returns 143 like any other command.
+        # So the ORIGINAL form tripped ERR on the SUCCESS path: maintenance
+        # completed perfectly, the sleeper was killed as designed, `wait` on it
+        # returned 143, the trap fired, recover() ran a second reclaim and
+        # restart, and the unit exited 143 -- leaving
+        # xsync-session@xsync-maintenance permanently `failed` after every
+        # weekly run, with a journal line that reads as a mid-flight SIGTERM.
+        #
+        # It was just as wrong the other way: an unguarded `wait "$_mpid"`
+        # tripped ERR before `local _mrc=$?` could run, so the "exceeded ${_mt}s"
+        # diagnostic was unreachable in BOTH directions -- a genuine maintenance
+        # disaster was indistinguishable from a normal night.
+        local _mrc=0
+        wait "$_mpid" || _mrc=$?
+        # Kill the sleeper's children BEFORE the sleeper itself. Once the
+        # subshell dies its `sleep` is reparented to init and pkill -P can no
+        # longer find it, leaving a stray `sleep 3600` alive for an hour after
+        # every successful maintenance run. Verified: with this order the orphan
+        # count is 0, without it, 1.
+        pkill -P "$_wpid" 2>/dev/null || true
+        kill "$_wpid" 2>/dev/null || true
+        wait "$_wpid" 2>/dev/null || true
+        (( _mrc == 0 )) || error "maintenance failed or exceeded ${_mt}s (rc=$_mrc) — tearing down"
+        return 0
+    fi
+
+    "$BIN/guest.sh" launch "$GAME_ID" || warn "launch request failed — leaving the guest at the Xbox app"
+
+    # Capture the installed-game list while the VM is up. The library sync runs
+    # later, after shutdown, when Steam is stopped and shortcuts.vdf is writable.
+    set_phase RUNNING
+    capture_games || warn "could not enumerate installed games this session"
+
+    start_watchdog
+    start_exit_monitor
+
+    # Block for the play session, but never indefinitely.
+    if ! "$BIN/vm.sh" wait "$XSYNC_MAX_SESSION_SECONDS"; then
+        error "session exceeded ${XSYNC_MAX_SESSION_SECONDS}s — forcing shutdown"
+        "$BIN/vm.sh" kill || true
+    fi
+
+    stop_exit_monitor
+    stop_watchdog
+
+    # Ask, while the guest is still up, whether a download is still running.
+    #
+    # This has to happen BEFORE the shutdown, and it applies to every exit path
+    # -- the View+Menu chord, the Guide overlay, and closing the launcher --
+    # because none of them knew about downloads. The watcher looked only at the
+    # Xbox app process and processes under C:\XboxGames; a Game Pass download is
+    # done by GamingServices, which is neither. Somebody who started a 300 GB
+    # install and quit back to Steam, rather than sitting in front of a black TV
+    # for two hours, had it thrown away.
+    # Re-capture the game list NOW, while the guest is still up.
+    #
+    # The capture after launch is a snapshot of what was installed when the
+    # session STARTED, and the single most common thing a user does in a session
+    # is install something. Browsing the Xbox app, installing a game, and quitting
+    # is the documented workflow -- and it ended with the new game present in the
+    # guest and absent from Steam, because the list written at teardown was the
+    # one taken before the install existed.
+    #
+    # The early capture is still worth keeping: it is the only one that survives
+    # a guest that later dies or refuses to answer.
+    capture_games || warn "could not re-enumerate games at teardown — the library may be stale"
+
+    # Ask the guest directly if it is still there, and otherwise trust the last
+    # reading the exit monitor took while it was. On the ordinary exit path the
+    # guest has already powered itself off by the time we get here, so the live
+    # probe is the fallback, not the mechanism.
+    local download_pending=0
+    if "$BIN/guest.sh" downloading >/dev/null 2>&1; then
+        log "a Game Pass download is still in progress — it will continue headless"
+        download_pending=1
+    elif [[ "$(cat "$XSYNC_STATE_DIR/download-active" 2>/dev/null || echo 0)" == "1" ]]; then
+        log "a Game Pass download was in progress when the guest went down — it will continue headless"
+        download_pending=1
+    fi
+
+    # Make certain QEMU is gone before going anywhere near the GPU.
+    "$BIN/vm.sh" stop || die "VM would not stop; refusing to touch the GPU"
+
+    "$BIN/gpu.sh" reclaim || error "GPU reclaim reported problems"
+
+    # Steam is still stopped here, which is exactly when shortcuts.vdf can be
+    # written safely. Never fatal: a library sync failure must not cost the user
+    # their desktop.
+    set_phase SYNC_LIBRARY
+    sync_library || warn "library sync failed — continuing"
+
+    "$BIN/session.sh" start || error "display manager did not start"
+
+    set_phase IDLE
+    log "=== xsync session finished cleanly ==="
+
+    # The user has their TV back; now finish the download behind them.
+    #
+    # systemd-run rather than a background child: this script IS a systemd unit
+    # with KillMode=control-group, so anything forked here dies the moment the
+    # unit exits. The watcher has to outlive it.
+    if (( download_pending )); then
+        log "starting the background download watcher"
+        systemd-run --unit=xsync-download-watch --collect \
+            --description="xsync background Game Pass download" \
+            "$BIN/xsync-download-watch" >/dev/null 2>&1 \
+            || warn "could not start the download watcher — the download will resume next session"
+    fi
+}
+
+# Enumerate installed games into the host-side cache.
+#
+# Refuses to overwrite a good cache with an empty result: an enumeration failure
+# is indistinguishable from "no games installed" on the wire, and treating the
+# latter as truth would delete every game shortcut from the user's Steam library.
+capture_games() {
+    local tmp="$XSYNC_STATE_DIR/games.json.new"
+    local dest="$XSYNC_VM_STORAGE_DIR/games.json"
+
+    # The guest emits CRLF and may prepend blank lines; take the first line that
+    # actually looks like the JSON array. Without this the captured file starts
+    # with a stray newline and every later json parse fails.
+    "$BIN/guest.sh" games 2>/dev/null | tr -d '\r' | grep -m1 '^\[' >"$tmp" || return 1
+    [[ -s "$tmp" ]] || return 1
+    jq -e 'type == "array"' <"$tmp" >/dev/null 2>&1 || return 1
+
+    local n; n="$(jq 'length' <"$tmp")"
+    if (( n == 0 )) && [[ -s "$dest" ]] && (( $(jq 'length' <"$dest" 2>/dev/null || echo 0) > 0 )); then
+        warn "enumeration returned no games but $dest lists some — keeping the existing list"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # Must not report success on a failed write: the whole function runs with
+    # errexit disabled (it is called as `capture_games || warn`), so an install
+    # failure here would fall through to the success log and the next library
+    # sync would silently use a stale game list.
+    if ! install -D -m 0644 "$tmp" "$dest"; then
+        rm -f "$tmp"
+        error "could not write the game list to $dest"
+        return 1
+    fi
+    rm -f "$tmp"
+    log "captured $n installed game(s)"
+}
+
+# The sync writes into the user's Steam directory, so it must not run as root or
+# it leaves root-owned files that Steam (running as the user) can no longer
+# rewrite — which silently breaks every shortcut change the user makes.
+sync_library() {
+    [[ -x "$BIN/library.py" ]] || { warn "library.py not installed"; return 1; }
+    setpriv --reuid="$XSYNC_UID" --regid="$XSYNC_GID" --init-groups \
+        env HOME="/var/home/$XSYNC_USER" XSYNC_ROOT="$XSYNC_ROOT" XSYNC_CONF="$XSYNC_CONF" \
+        "$BIN/library.py" sync
+}
+
+main "$@"
+
+# Reaching here means the clean path completed and the session is already back.
+# Disarm the EXIT trap so it does not run a redundant recovery.
+RECOVERED=1

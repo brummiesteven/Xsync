@@ -1,0 +1,44 @@
+#!/usr/bin/bash
+# xsync — the shim Steam actually launches.
+#
+#   xsync-launch <game-id>
+#
+# This is the target of every xsync shortcut in Steam. It does almost nothing:
+# it asks systemd to start the handoff as a system unit and returns. That
+# indirection is the whole point — the handoff tears down the very session this
+# process lives in, so the work must not happen here.
+#
+# Runs unprivileged. The single privileged action is allowlisted in
+# /etc/sudoers.d/xsync (see tools/xsync-setup).
+
+set -euo pipefail
+
+GAME_ID="${1:-xbox-app}"
+
+# Steam shortcut arguments arrive from a GUI; be strict about what we hand to systemd.
+if [[ ! "$GAME_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "xsync-launch: invalid game id: $GAME_ID" >&2
+    exit 64
+fi
+
+UNIT="xsync-session@${GAME_ID}.service"
+
+# Go through the privileged shim rather than sudo-ing systemctl directly.
+# The sudoers rule that allowed the latter needed a wildcard, and a sudoers
+# wildcard can span a space and swallow additional arguments -- which made it
+# possible to start any unit at all as root. The shim takes one argument and
+# validates it, so the rule needs no wildcard.
+HELPER="/var/lib/xsync/app/host/bin/xsync-start-session"
+
+# --no-block: systemd starts the unit and returns immediately. We must not wait,
+# because the unit is about to kill this process's session.
+if ! sudo -n "$HELPER" "$GAME_ID" 2>/dev/null; then
+    echo "xsync-launch: could not start $UNIT" >&2
+    echo "Is xsync installed? Run: sudo tools/xsync-setup install" >&2
+    exit 1
+fi
+
+# Give systemd a moment to take over so Steam sees a plausible run, then exit.
+# The session teardown will terminate us shortly regardless.
+sleep 2
+exit 0

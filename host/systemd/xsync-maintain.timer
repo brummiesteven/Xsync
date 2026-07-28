@@ -1,0 +1,15 @@
+[Unit]
+Description=Weekly xsync guest maintenance
+Documentation=https://github.com/brummiesteven/Xsync
+
+[Timer]
+# Weekly, at an hour when a living-room machine is unlikely to be in use. The
+# service checks the display anyway and does nothing if anyone is watching, so
+# this is a hint rather than a guarantee.
+OnCalendar=Wed 04:00
+# Catch up if the machine was off. Randomised so a fleet does not stampede.
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target

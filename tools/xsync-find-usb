@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+#
+# xsync - work out which USB controller to hand to the guest.
+#
+# XSYNC_USB_PCI is the one required value a new user has no way to guess, and
+# getting it wrong is the difference between a working controller and none. It
+# has to satisfy three things at once, and nothing checked any of them:
+#
+#   1. It carries the input devices you actually game with. Passing a controller
+#      that has nothing on it hands the guest an empty bus.
+#   2. It sits in its own IOMMU group. VFIO claims a whole group, so a controller
+#      sharing a group with, say, the SATA controller cannot be passed through
+#      without taking the disk with it.
+#   3. You can live without it on the host for the duration of a session. This is
+#      the one people miss: the whole controller moves to the guest, so anything
+#      on it -- Bluetooth radio included -- disappears from the host until the
+#      game exits.
+#
+# Point 3 matters more than it looks. A Bluetooth gamepad only reaches the guest
+# if the Bluetooth radio is on the controller being passed, and even then the pad
+# must be paired to Windows separately: pairing is per radio per OS, so pairing on
+# the host does not carry over.
+#
+# Read-only. Prints what it finds and suggests a value; changes nothing.
+
+set -euo pipefail
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+dim()  { printf '\033[2m%s\033[0m\n' "$*"; }
+good() { printf '  \033[32m%s\033[0m\n' "$*"; }
+warn() { printf '  \033[33m%s\033[0m\n' "$*"; }
+
+command -v lspci >/dev/null 2>&1 || { echo "lspci not found" >&2; exit 1; }
+
+iommu_group_of() {
+    local addr="$1" link
+    link="$(readlink -f "/sys/bus/pci/devices/$addr/iommu_group" 2>/dev/null || true)"
+    [[ -n "$link" ]] && basename "$link" || echo "-"
+}
+
+# Everything else sharing this device's IOMMU group. VFIO takes the group as a
+# unit, so these come along whether you want them or not.
+group_peers() {
+    local addr="$1" grp peers=() d desc
+    grp="$(iommu_group_of "$addr")"
+    [[ "$grp" == "-" ]] && return
+    for d in /sys/kernel/iommu_groups/"$grp"/devices/*; do
+        [[ -e "$d" ]] || continue
+        d="$(basename "$d")"
+        [[ "$d" == "$addr" ]] && continue
+        desc="$(lspci -s "$d" 2>/dev/null | cut -d' ' -f2- | cut -c1-52)"
+        # A PCI bridge in the group is not a problem and is present in almost
+        # every real topology -- vfio does not bind bridges. Warning about it
+        # would talk people out of the correct answer.
+        [[ "$desc" == PCI\ bridge* ]] && continue
+        peers+=("$d $desc")
+    done
+    # An empty array still prints one blank line through printf, which mapfile
+    # then reads as a phantom peer -- so every isolated controller reported
+    # itself as sharing a group with nothing.
+    (( ${#peers[@]} )) || return 0
+    printf '%s\n' "${peers[@]}"
+}
+
+# USB devices sitting on a given PCI controller.
+devices_on() {
+    local addr="$1" d ctrl vid pid product
+    for d in /sys/bus/usb/devices/*/; do
+        [[ -f "$d/idVendor" ]] || continue
+        ctrl="$(readlink -f "$d" | grep -oP '0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | tail -1)"
+        [[ "$ctrl" == "$addr" ]] || continue
+        vid="$(cat "$d/idVendor")"; pid="$(cat "$d/idProduct")"
+        product="$(cat "$d/product" 2>/dev/null || echo '?')"
+        # Root hubs are not interesting: every controller has them.
+        [[ "$vid" == "1d6b" ]] && continue
+        printf '%s:%s  %s\n' "$vid" "$pid" "$product"
+    done
+}
+
+bold "USB controllers on this machine"
+echo
+
+best=""; best_score=-1
+while read -r addr rest; do
+    [[ -z "$addr" ]] && continue
+    full="0000:$addr"
+    grp="$(iommu_group_of "$full")"
+    mapfile -t devs < <(devices_on "$full")
+    mapfile -t peers < <(group_peers "$full")
+
+    bold "$full  $(printf '%s' "$rest" | cut -c1-56)"
+    echo "  IOMMU group: $grp"
+
+    if (( ${#devs[@]} == 0 )); then
+        dim "  no devices attached"
+    else
+        for d in "${devs[@]}"; do echo "  device: $d"; done
+    fi
+
+    if (( ${#peers[@]} )); then
+        warn "shares its IOMMU group with:"
+        for p in "${peers[@]}"; do warn "    $p"; done
+        warn "passing this through takes those with it"
+    else
+        good "alone in its IOMMU group — safe to pass through"
+    fi
+
+    # Score it: input devices are what we want, group isolation is required.
+    score=0
+    (( ${#peers[@]} == 0 )) && score=$(( score + 10 ))
+    for d in "${devs[@]}"; do
+        case "${d,,}" in
+            *bluetooth*|*keyboard*|*mouse*|*controller*|*gamepad*|*receiver*|*xbox*)
+                score=$(( score + 5 ));;
+            *) score=$(( score + 1 ));;
+        esac
+    done
+    (( score > best_score )) && { best_score=$score; best="$full"; }
+    echo
+done < <(lspci | grep -i 'usb controller')
+
+if [[ -n "$best" ]]; then
+    bold "Suggested"
+    echo "  XSYNC_USB_PCI=$best"
+    echo
+    dim "  Check the device list above is the one holding your controller,"
+    dim "  keyboard or Bluetooth radio. Everything on it leaves the host while"
+    dim "  a game is running and comes back when you quit."
+    echo
+    dim "  Bluetooth gamepad? It only works in the guest if the radio is on this"
+    dim "  controller, and you must pair the pad inside Windows once — Bluetooth"
+    dim "  pairings do not carry across operating systems."
+else
+    echo "No USB controllers found." >&2
+    exit 1
+fi

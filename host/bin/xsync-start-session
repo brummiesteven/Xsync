@@ -1,0 +1,47 @@
+#!/usr/bin/bash
+# xsync — privileged shim: start exactly one session unit, for one validated id.
+#
+#   xsync-start-session <game-id>
+#
+# This exists because a sudoers rule cannot safely contain a wildcard.
+#
+# The rule used to be:
+#
+#     NOPASSWD: /usr/bin/systemctl start --no-block xsync-session@*.service
+#
+# and its comment claimed "Nothing else is granted". That was wrong. sudoers(5)
+# is explicit: "Because command line arguments are matched as a single,
+# concatenated string, a wildcard can match multiple arguments." So the `*`
+# happily spanned a space, and this was permitted:
+#
+#     sudo systemctl start --no-block xsync-session@x.service any-other.service
+#
+# — starting an ARBITRARY systemd unit as root, with no password. It was
+# demonstrated on the reference machine before being fixed here. On that machine
+# the user is also in wheel so it granted nothing new, but the entire point of
+# the drop-in is to make xsync usable by an unprivileged Steam session, and for
+# that user it was a straightforward local privilege escalation.
+#
+# The fix is to grant a fixed path with no wildcard at all, and do the validating
+# here, where it can be done properly: one argument, matched against a strict
+# pattern, interpolated into a unit name that cannot contain anything else.
+
+set -euo pipefail
+
+GAME_ID="${1:-}"
+
+# Deliberately stricter than systemd's own escaping rules. A game id comes from a
+# Steam shortcut argument, so it is attacker-influenced in the threat model that
+# matters; anything outside this set has no legitimate reason to appear.
+if [[ ! "$GAME_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+    echo "xsync-start-session: invalid game id: ${GAME_ID@Q}" >&2
+    exit 64
+fi
+
+# Refuse anything that would escape the template, belt-and-braces against a
+# future change to the pattern above.
+case "$GAME_ID" in
+    *[!A-Za-z0-9._-]* | */* | *@* ) echo "xsync-start-session: rejected id" >&2; exit 64 ;;
+esac
+
+exec /usr/bin/systemctl start --no-block "xsync-session@${GAME_ID}.service"

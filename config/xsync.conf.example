@@ -1,0 +1,233 @@
+# xsync configuration
+#
+#   cp config/xsync.conf.example config/xsync.conf
+#   $EDITOR config/xsync.conf
+#   tools/xsync-doctor
+#
+# There is no autodetection. Every value below is the one that was correct on
+# the reference machine (Bazzite 43 / Ryzen 9 7950X / RTX 4090 / 4K TV), and
+# almost none of them will be correct on yours.
+#
+# YOU MUST AT MINIMUM CHANGE:
+#
+#   XSYNC_GPU_PCI, XSYNC_GPU_AUDIO_PCI, XSYNC_GPU_IOMMU_GROUP   (lspci -nnk)
+#   XSYNC_USB_PCI                                               (see below)
+#   XSYNC_USER, XSYNC_UID                                       (id)
+#   XSYNC_STEAM_ROOT
+#   XSYNC_VM_CPUSET, XSYNC_VM_EMULATOR_CPUSET, XSYNC_VM_CORES   (lscpu -e)
+#   XSYNC_VM_RAM_MIB
+#   XSYNC_GUEST_PASSWORD
+#
+# `tools/xsync-doctor` checks most of these and tells you what is wrong.
+#
+# This file is sourced by root-run shell scripts, so treat it as executable
+# code: it must be owned by root or by you, and must not be world-writable.
+# It holds a guest password and an API key, so keep it mode 0640.
+# It is git-ignored for that reason.
+
+########################################
+# Display topology
+########################################
+# handoff   : TV stays on the passthrough GPU; host session is torn down during play.
+#             Best performance, no Steam overlay while playing. (v1 — implemented)
+# moonlight : host session stays alive on a second GPU/iGPU, VM streams to it.
+#             Steam overlay preserved, lower fidelity. (future backend)
+XSYNC_MODE=handoff
+
+########################################
+# GPU to hand to the VM
+########################################
+# Must be alone in its IOMMU group. Verify with: tools/xsync-doctor
+# Full domain:bus:slot.function form is required, exactly as `lspci -D` prints
+# it -- the short "01:00.0" form renders an invalid domain.
+XSYNC_GPU_PCI=0000:01:00.0
+XSYNC_GPU_AUDIO_PCI=0000:01:00.1
+XSYNC_GPU_IOMMU_GROUP=12
+
+# Host driver to restore after the VM exits.
+XSYNC_GPU_HOST_DRIVER=nvidia
+# Kernel modules unloaded (in order) to release the GPU, reloaded in reverse.
+XSYNC_GPU_MODULES="nvidia_drm nvidia_modeset nvidia_uvm nvidia"
+
+########################################
+# Host session
+########################################
+# Display manager owning the gamescope session. Stopping this stops Steam.
+XSYNC_DISPLAY_MANAGER=sddm
+# User session unit (informational; stopped implicitly with the DM).
+XSYNC_SESSION_UNIT=gamescope-session-plus@steam.service
+# The desktop user Steam runs as. `id -un` and `id -u`.
+XSYNC_USER=YOUR_USER
+XSYNC_UID=1000
+
+########################################
+# Virtual machine
+########################################
+XSYNC_VM_NAME=xsync-win11
+XSYNC_VM_RAM_MIB=20480
+# Physical cores given to the VM. Default 8 = all of CCD1 on the 7950X.
+# Kept within ONE CCD deliberately: spanning CCDs crosses L3 and causes
+# frametime stutter. Raise to 12 only for genuinely CPU-bound titles.
+XSYNC_VM_CORES=8
+# Host CPU list the VM's vCPUs are pinned to (physical,sibling pairs).
+XSYNC_VM_CPUSET="8-15,24-31"
+# CPUs reserved for QEMU emulator + I/O threads (CCD0).
+XSYNC_VM_EMULATOR_CPUSET="0-3,16-19"
+
+XSYNC_VM_DISK=/var/lib/xsync/win11.raw
+XSYNC_VM_DISK_SIZE=512G
+XSYNC_VM_STORAGE_DIR=/var/lib/xsync
+
+########################################
+# Controller passthrough
+########################################
+# THE WHOLE USB CONTROLLER IS PASSED THROUGH, not the dongle on its own.
+#
+# Attaching the Xbox dongle as an individual USB device does not work, and it
+# fails while reporting success from every angle. Attaching the device resets
+# it, so it re-enumerates with a new USB device number, and the address libvirt
+# recorded is stale before it is ever used. The host log says "attached", the
+# domain lists the hostdev, and the guest has no controller. See
+# docs/FINDINGS.md, "USB: pass the controller, not the device".
+#
+# Set this to a USB controller that is alone in its IOMMU group and carries the
+# dongle. Every device on it goes to the guest for the duration of a session
+# and comes back afterwards, so do not pick the controller your keyboard is on
+# unless you are happy to lose it while playing.
+#
+#   for d in /sys/kernel/iommu_groups/*/devices/*; do
+#       echo "group ${d%/devices/*}: $(lspci -nns ${d##*/})"
+#   done | grep -i usb
+#
+# Leave EMPTY to fall back to per-device dongle attach. That path is known not
+# to work reliably and additionally blacklists the host's xone_dongle driver,
+# which leaves the dongle inert on the host -- no LED, and the pair button does
+# nothing. Only use it if you have no isolatable USB controller.
+XSYNC_USB_PCI=0000:0a:00.0
+
+XSYNC_DONGLE_VENDOR=045e
+XSYNC_DONGLE_PRODUCT=02e6
+# If the dongle is absent at launch, continue anyway (game may be keyboard-playable).
+XSYNC_DONGLE_REQUIRED=false
+# Only consulted when XSYNC_USB_PCI is empty. 1 = blacklist xone_dongle so the
+# host never claims the dongle. Costs you the dongle on the host; see above.
+XSYNC_DONGLE_RESERVE=1
+
+########################################
+# Windows guest install
+########################################
+XSYNC_WINDOWS_ISO=/var/lib/xsync/iso/win11.iso
+XSYNC_VIRTIO_ISO=/var/lib/xsync/iso/virtio-win.iso
+# Must match an edition name in the ISO exactly. Check with:
+#   tools/xsync-make-unattend --list-editions
+XSYNC_WINDOWS_EDITION="Windows 11 Pro"
+# Local account the guest auto-logs into. The agent needs an interactive session
+# to draw the exit overlay and read the controller, so autologin is required.
+# This account never faces the internet; the guest only ever shows a game.
+XSYNC_GUEST_USER=xsync
+XSYNC_GUEST_PASSWORD=changeme
+XSYNC_GUEST_HOSTNAME=xsync-win11
+# Your real product key. Leave empty to install unactivated and activate later
+# in Settings > System > Activation.
+XSYNC_WINDOWS_KEY=
+# Edition-selection key used when XSYNC_WINDOWS_KEY is empty.
+#
+# This is Microsoft's published generic key for Windows 11 Pro. It is NOT a
+# licence and does NOT activate anything — its only job is telling setup which
+# edition to install. Without some key present, setup stops on the "Product key"
+# screen waiting for input, which defeats an unattended install. Change this if
+# you install an edition other than Pro.
+XSYNC_WINDOWS_INSTALL_KEY=VK7JG-NPHTM-C97JM-9MPGT-3V66T
+XSYNC_TIMEZONE="GMT Standard Time"
+# UI language MUST match the language of the Windows media. An en-US ISO has no
+# en-GB resources, and setup responds by silently discarding the entire windowsPE
+# pass and falling back to an interactive install — with no error shown.
+# Input and user locale are independent and can stay British.
+XSYNC_UI_LANGUAGE=en-US
+# Keyboard layout QEMU assumes for the VNC console. Must match XSYNC_INPUT_LOCALE
+# below, or symbols that differ between layouts (notably '@') type incorrectly.
+XSYNC_VNC_KEYMAP=en-gb
+XSYNC_INPUT_LOCALE=0809:00000809
+XSYNC_SYSTEM_LOCALE=en-GB
+XSYNC_USER_LOCALE=en-GB
+
+########################################
+# Xbox Full Screen Experience
+########################################
+# The console-style shell -- Microsoft's answer to SteamOS. This is what makes
+# the guest look like an Xbox rather than a Windows desktop, and it is applied
+# automatically on first boot.
+#
+# It re-binds the Guide button to its own task switcher. That does not affect
+# xsync's exit chord, which reads the pad through Raw Input rather than XInput,
+# but it does mean Guide alone will not quit a game.
+#
+# Set to 0 for a plain Windows desktop in the guest.
+XSYNC_ENABLE_FSE=1
+
+########################################
+# Firmware blackout
+########################################
+# The play profile has no emulated display, so OVMF draws its TianoCore splash
+# through the passed-through GPU's option ROM. Hiding the ROM from the guest
+# leaves the firmware with no graphics console, so the TV stays black from
+# power-on until Windows brings the card up -- roughly ten seconds of logo that
+# nothing else can suppress.
+#
+# The trade-off: the firmware phase becomes genuinely headless. No boot menu,
+# no setup screen, no error text. Set this to 0 if you need to see it.
+XSYNC_HIDE_FIRMWARE_LOGO=1
+
+########################################
+# Steam integration
+########################################
+# On an ostree distro (Bazzite, Silverblue) $HOME is really /var/home/<user>.
+XSYNC_STEAM_ROOT=/home/YOUR_USER/.local/share/Steam
+# Steam userdata profile(s) to sync shortcuts into.
+# "auto" = most recently used profile. Or a space-separated list of numeric IDs
+# as they appear under $XSYNC_STEAM_ROOT/userdata/.
+XSYNC_STEAM_PROFILES=auto
+
+# SteamGridDB API key for artwork. Free: https://www.steamgriddb.com/profile/preferences/api
+# Without this, shortcuts are still created but have no artwork.
+XSYNC_SGDB_API_KEY=
+
+########################################
+# Performance logging
+########################################
+# Record real frame times with PresentMon during each session, written to
+# C:\ProgramData\xsync\perf\ in the guest.
+#
+# GPU utilisation is not framerate: a card at 56% may be vsync-locked with
+# headroom, or CPU-bound and dropping frames, and the number looks the same
+# either way. Frame times distinguish them -- and the 99th percentile frame
+# time is the stutter measure that an average FPS figure hides completely.
+#
+# PresentMon is Intel's, MIT licensed, a single portable exe. Downloaded into
+# the guest during maintenance; nothing is bundled here.
+XSYNC_PERF_LOGGING=1
+
+########################################
+# Timing / safety
+########################################
+# Seconds to wait for the guest agent to report in before assuming failure.
+XSYNC_BOOT_TIMEOUT=300
+# Seconds without a guest heartbeat before the watchdog force-destroys the VM.
+XSYNC_HEARTBEAT_TIMEOUT=30
+# Seconds to wait for graceful VM shutdown before `virsh destroy`.
+XSYNC_SHUTDOWN_TIMEOUT=60
+# Retries for GPU rebind before giving up and restoring the session regardless.
+XSYNC_GPU_REBIND_RETRIES=3
+
+XSYNC_STATE_DIR=/run/xsync
+XSYNC_LOG=/var/log/xsync/xsync.log
+
+# How long the exit monitor waits for a game to appear before concluding the
+# launch never happened and ending the session. Without this the monitor polls
+# forever when a launch fails, and the VM holds the GPU behind a black TV.
+XSYNC_LAUNCH_GRACE=300
+
+# Absolute ceiling on a maintenance run. This path returns before the watchdog
+# and the session ceiling are started, so it is the one guest operation with no
+# other supervision at all.
+XSYNC_MAINTENANCE_TIMEOUT=3600

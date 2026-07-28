@@ -1,0 +1,45 @@
+[Unit]
+Description=xsync Xbox game session (%i)
+Documentation=https://github.com/brummiesteven/Xsync
+# The whole point of this unit is to outlive the graphical session it tears down,
+# so it must not be ordered as part of it.
+After=libvirtd.service
+Requires=libvirtd.service
+# Note: mutual exclusion between concurrent handoffs is enforced by a flock in
+# xsync-session, NOT here. Conflicts= cannot express "no other instance of this
+# template", and systemd would happily start xsync-session@a and @b in parallel.
+#
+# OnFailure is deliberately NOT wired to xsync-recover: a second launch failing
+# its preflight would then destroy the VM of the session currently being played.
+# ExecStopPost below already runs recovery for this unit's own failures.
+
+[Service]
+Type=oneshot
+# A play session lasts as long as the user plays.
+TimeoutStartSec=infinity
+RemainAfterExit=no
+
+Environment=XSYNC_ROOT=/var/lib/xsync/app
+ExecStart=/var/lib/xsync/app/host/bin/xsync-session %i
+
+# If systemd stops this unit, run the same recovery the script would.
+ExecStopPost=-/var/lib/xsync/app/host/bin/xsync-recover
+
+# Needs full privilege: unbinds PCI devices, unloads kernel modules,
+# stops the display manager.
+User=root
+# control-group, not mixed: during play the orchestrator is blocked in
+# `vm.sh wait`, a child process. Under KillMode=mixed only the main shell is
+# signalled, and bash cannot run its TERM handler until the foreground child
+# returns — so a `systemctl stop` did nothing for the full TimeoutStopSec and
+# then SIGKILLed, making the INT/TERM trap dead code for the entire session.
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=180
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsync
+
+[Install]
+WantedBy=multi-user.target

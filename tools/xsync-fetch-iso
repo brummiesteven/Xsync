@@ -1,0 +1,142 @@
+#!/usr/bin/bash
+# xsync — fetch the official Windows 11 ISO from Microsoft.
+#
+#   tools/xsync-fetch-iso [--edition <id>] [--lang English] [--url-only] [--out <path>]
+#
+# Microsoft guards the download-link API with a bot check ("Sentinel"). Simply
+# calling the API is always rejected; the session has to be whitelisted first
+# through two separate services:
+#
+#   1. vlscppe.microsoft.com/tags   registers the session id
+#   2. ov-df.microsoft.com/mdt.js   returns a token `w` and a `rticks` value that
+#      must be echoed back to ov-df.microsoft.com to complete the handshake
+#
+# Only then will getskuinformationbyproductedition and GetProductDownloadLinksBySku
+# answer. The flow and its magic constants are derived from Fido
+# (https://github.com/pbatard/Fido, GPLv3, by Pete Batard) — Fido itself refuses
+# to run off Windows, so this is a portable reimplementation of the same handshake.
+#
+# The resulting link is tied to the session and expires after roughly 24 hours.
+
+set -uo pipefail
+
+XSYNC_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export XSYNC_ROOT
+source "$XSYNC_ROOT/host/bin/xsync-common.sh"
+
+# Constants lifted from Fido; these are Microsoft's, not ours, and do change.
+ORG_ID="y6jn8c31"
+PROFILE_ID="606624d44113"
+INSTANCE_ID="560dc9f3-1aa5-4a2f-b63c-9e18f8d0e175"
+LOCALE="en-US"
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+EDITION=""
+LANG_WANT="English"
+URL_ONLY=0
+OUT="${XSYNC_VM_STORAGE_DIR:-/var/lib/xsync}/iso/win11.iso"
+
+while (( $# )); do
+    case "$1" in
+        --edition)  EDITION="$2"; shift 2 ;;
+        --lang)     LANG_WANT="$2"; shift 2 ;;
+        --url-only) URL_ONLY=1; shift ;;
+        --out)      OUT="$2"; shift 2 ;;
+        -h|--help)  sed -n '2,25p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+SID="$(cat /proc/sys/kernel/random/uuid)"
+CURL=(curl -sS --max-time 30 -A "$UA" -H "Accept-Language: en-US,en;q=0.9")
+
+log "session id: $SID"
+
+# --- 0. discover the current product edition id -----------------------------
+if [[ -z "$EDITION" ]]; then
+    log "discovering current Windows 11 edition id"
+    EDITION="$("${CURL[@]}" "https://www.microsoft.com/en-us/software-download/windows11" \
+        | grep -oE 'option value="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+    [[ -n "$EDITION" ]] || die "could not discover the product edition id"
+fi
+log "product edition id: $EDITION"
+
+# --- 1. whitelist the session ----------------------------------------------
+log "registering session with vlscppe"
+"${CURL[@]}" -o /dev/null "https://vlscppe.microsoft.com/tags?org_id=${ORG_ID}&session_id=${SID}" \
+    || warn "vlscppe request failed — continuing"
+
+# --- 2. device-fingerprint handshake ---------------------------------------
+log "requesting ov-df challenge"
+MDT="$("${CURL[@]}" "https://ov-df.microsoft.com/mdt.js?instanceId=${INSTANCE_ID}&PageId=si&session_id=${SID}")"
+W="$(grep -oE '[?&]w=[A-F0-9]+' <<<"$MDT" | head -1 | cut -d= -f2)"
+RTICKS="$(grep -oE 'rticks="?\+?[0-9]+' <<<"$MDT" | head -1 | grep -oE '[0-9]+$')"
+[[ -n "$W" && -n "$RTICKS" ]] || die "could not extract the ov-df challenge (Microsoft may have changed the flow)"
+log "challenge: w=${W:0:12}... rticks=$RTICKS"
+
+log "answering ov-df challenge"
+"${CURL[@]}" -o /dev/null \
+    "https://ov-df.microsoft.com/?session_id=${SID}&CustomerId=${INSTANCE_ID}&PageId=si&w=${W}&mdt=$(date +%s%3N)&rticks=${RTICKS}" \
+    || warn "ov-df reply failed — continuing"
+
+# --- 3. SKU lookup ----------------------------------------------------------
+log "looking up SKUs"
+SKUS=""
+for attempt in 1 2 3; do
+    SKUS="$("${CURL[@]}" -H "Referer: https://www.microsoft.com/software-download/windows11" \
+        "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition?profile=${PROFILE_ID}&productEditionId=${EDITION}&SKU=undefined&friendlyFileName=undefined&Locale=${LOCALE}&sessionID=${SID}")"
+    jq -e '.Skus[0]' >/dev/null 2>&1 <<<"$SKUS" && break
+    warn "SKU lookup attempt $attempt failed, retrying"
+    sleep 2
+done
+jq -e '.Skus[0]' >/dev/null 2>&1 <<<"$SKUS" \
+    || die "SKU lookup failed: $(jq -r '.Errors[]?.Value // "unknown"' <<<"$SKUS" 2>/dev/null)"
+
+SKU_ID="$(jq -r --arg l "$LANG_WANT" \
+    '.Skus[] | select(.Language == $l) | .Id' <<<"$SKUS" | head -1)"
+if [[ -z "$SKU_ID" ]]; then
+    warn "no exact match for language '$LANG_WANT'; available:"
+    jq -r '.Skus[].Language' <<<"$SKUS" | head -20 >&2
+    die "pick one with --lang"
+fi
+PRODUCT="$(jq -r --arg l "$LANG_WANT" '.Skus[] | select(.Language == $l) | .ProductDisplayName' <<<"$SKUS" | head -1)"
+log "selected: $PRODUCT ($LANG_WANT, SKU $SKU_ID)"
+
+# --- 4. download link -------------------------------------------------------
+log "requesting download link"
+LINKS="$("${CURL[@]}" -H "Referer: https://www.microsoft.com/software-download/windows11" \
+    "https://www.microsoft.com/software-download-connector/api/GetProductDownloadLinksBySku?profile=${PROFILE_ID}&productEditionId=undefined&SKU=${SKU_ID}&friendlyFileName=undefined&Locale=${LOCALE}&sessionID=${SID}")"
+
+if ! jq -e '.ProductDownloadOptions[0].Uri' >/dev/null 2>&1 <<<"$LINKS"; then
+    ERR="$(jq -r '.Errors[]?.Value // "unknown"' <<<"$LINKS" 2>/dev/null)"
+    error "Microsoft refused the download request: $ERR"
+    cat >&2 <<EOF
+
+This usually means the bot check rejected us. Options:
+
+  * retry — the check is partly probabilistic
+  * download manually in a browser on this machine:
+      https://www.microsoft.com/software-download/windows11
+    choose "Windows 11 (multi-edition ISO for x64 devices)", then save to:
+      $OUT
+
+EOF
+    exit 1
+fi
+
+URL="$(jq -r '.ProductDownloadOptions[] | select(.DownloadType == 0 or .DownloadType == 1) | .Uri' <<<"$LINKS" | head -1)"
+[[ -n "$URL" ]] || URL="$(jq -r '.ProductDownloadOptions[0].Uri' <<<"$LINKS")"
+
+if (( URL_ONLY )); then
+    echo "$URL"
+    exit 0
+fi
+
+log "downloading to $OUT (this is ~6 GB)"
+mkdir -p "$(dirname "$OUT")"
+if curl -fL --progress-bar -C - -o "$OUT.part" "$URL"; then
+    mv "$OUT.part" "$OUT"
+    log "saved $OUT ($(du -h "$OUT" | cut -f1))"
+else
+    die "download failed; the link expires after ~24h, re-run to get a fresh one"
+fi

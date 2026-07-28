@@ -1,0 +1,75 @@
+#!/usr/bin/bash
+# xsync — generate Steam artwork for xsync's own library entries.
+#
+#   tools/xsync-make-artwork <out-dir> [name] [subtitle] [accent]
+#
+# SteamGridDB has artwork for games. It has nothing for "run guest maintenance",
+# which is an xsync entry rather than a title, so a shortcut for it would sit in
+# Big Picture as a bare grey box with a filename on it -- conspicuously the one
+# ugly tile in an otherwise finished-looking library.
+#
+# Steam wants several sizes and picks between them by context:
+#   <appid>p.png     600x900   portrait grid, the main library tile
+#   <appid>.png     1920x620   wide capsule
+#   <appid>_hero.png 1920x620  banner behind the game page
+#   <appid>_logo.png           transparent overlay on the hero
+#
+# Everything here is generated locally with ImageMagick. No network, no assets
+# to ship, and it re-renders identically on any machine.
+set -uo pipefail
+
+OUT="${1:?usage: xsync-make-artwork <out-dir> [name] [subtitle] [accent]}"
+NAME="${2:-xsync}"
+SUB="${3:-Guest Maintenance}"
+ACCENT="${4:-#66c0f4}"
+
+command -v magick >/dev/null 2>&1 || { echo "xsync-make-artwork: ImageMagick (magick) not found" >&2; exit 1; }
+
+mkdir -p "$OUT"
+
+# Pick a font that exists rather than assuming one. Steam's own UI is close to
+# Motiva Sans; these are the usual stand-ins on a Linux desktop.
+FONT=""
+for f in "Noto-Sans-Bold" "DejaVu-Sans-Bold" "Liberation-Sans-Bold" "Cantarell-Extra-Bold"; do
+    if magick -list font 2>/dev/null | grep -qi "^  Font: ${f}$"; then FONT="$f"; break; fi
+done
+[[ -n "$FONT" ]] || FONT="helvetica"
+
+BG1='#0b0f14'
+BG2='#1b2838'   # Steam's own dark blue
+FG='#e6edf3'
+DIM='#8b98a5'
+
+# A vertical gradient with a soft accent glow behind the text, which reads far
+# better on a TV at distance than a flat colour.
+panel() {
+    local w="$1" h="$2" title_pt="$3" sub_pt="$4" out="$5"
+    magick -size "${w}x${h}" "gradient:${BG2}-${BG1}" \
+        \( -size "${w}x${h}" radial-gradient:"${ACCENT}"-none -alpha set -channel A -evaluate multiply 0.16 +channel \) \
+        -compose over -composite \
+        -font "$FONT" \
+        -fill "$FG"     -pointsize "$title_pt" -gravity center -annotate "+0-$((sub_pt))" "$NAME" \
+        -fill "$DIM"    -pointsize "$sub_pt"   -gravity center -annotate "+0+$((title_pt/2))" "$SUB" \
+        -fill "$ACCENT" -gravity south -pointsize $((sub_pt/2)) -annotate '+0+24' 'xsync' \
+        "$out"
+}
+
+panel 600  900  72 30 "$OUT/portrait.png"
+panel 1920 620  96 40 "$OUT/hero.png"
+cp "$OUT/hero.png" "$OUT/wide.png"
+
+# Logo: transparent, for overlaying on the hero.
+magick -size 1200x400 xc:none -font "$FONT" \
+    -fill "$FG"     -pointsize 130 -gravity center -annotate '+0-40' "$NAME" \
+    -fill "$ACCENT" -pointsize 46  -gravity center -annotate '+0+70' "$SUB" \
+    "$OUT/logo.png"
+
+# Icon, for the small list view.
+magick -size 256x256 "gradient:${BG2}-${BG1}" \
+    -font "$FONT" -fill "$ACCENT" -pointsize 150 -gravity center -annotate '+0+0' 'x' \
+    "$OUT/icon.png"
+
+echo "artwork written to $OUT:"
+for f in portrait hero wide logo icon; do
+    [[ -f "$OUT/$f.png" ]] && printf '  %-10s %s\n' "$f" "$(magick identify -format '%wx%h %b' "$OUT/$f.png" 2>/dev/null)"
+done

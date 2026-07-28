@@ -1,0 +1,117 @@
+#!/usr/bin/bash
+# xsync — run the unattended Windows install.
+#
+#   sudo tools/xsync-install-windows [--restart] [--watch] [--wipe]
+#
+# --wipe is required to reinstall over a disk that already holds Windows. The
+# answer file repartitions disk 0 unconditionally, so without that guard a
+# second run destroys the existing guest and every game installed in it.
+#
+# Rebuilds the unattend media, boots the VM from the Windows ISO, and gets past
+# the one thing that stops an unattended install being unattended: Microsoft's
+# "Press any key to boot from CD or DVD" prompt. Nobody is at the keyboard, the
+# prompt times out after about five seconds, and the machine then declares it has
+# no bootable device. So Enter is sent repeatedly across that window.
+#
+# The install itself is headless — the guest has a virtio display on VNC and no
+# passthrough — so the TV keeps showing Steam throughout.
+
+set -uo pipefail
+
+XSYNC_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export XSYNC_ROOT
+source "$XSYNC_ROOT/host/bin/xsync-common.sh"
+
+VIRSH="virsh --connect qemu:///system"
+RESTART=0
+WATCH=0
+WIPE=0
+
+while (( $# )); do
+    case "$1" in
+        --restart) RESTART=1; shift ;;
+        --watch)   WATCH=1; shift ;;
+        --wipe)    WIPE=1; shift ;;
+        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+need_root
+
+for f in "$XSYNC_WINDOWS_ISO" "$XSYNC_VIRTIO_ISO"; do
+    [[ -f "$f" ]] || die "missing: $f"
+done
+
+# Refuse to silently destroy an existing installation.
+#
+# autounattend.xml sets <WillWipeDisk>true</WillWipeDisk> on disk 0, so running
+# this a second time repartitions the VM disk with no prompt — taking Windows,
+# the Xbox app sign-in and every installed game with it. That can easily be
+# 150 GB of downloads and an evening of setup.
+#
+# A disk that already has a partition table is treated as "installed". The
+# check is deliberately crude: false positives cost one --wipe flag, a false
+# negative costs the user everything on it.
+if [[ -f "$XSYNC_VM_DISK" ]] && (( ! WIPE )); then
+    if command -v sfdisk >/dev/null 2>&1 && sfdisk -l "$XSYNC_VM_DISK" 2>/dev/null | grep -qE '^/|Disklabel type'; then
+        die "$XSYNC_VM_DISK already contains a partition table.
+
+Installing Windows will ERASE it, including any installed games.
+If that is what you want, re-run with --wipe."
+    fi
+fi
+(( WIPE )) && warn "--wipe given: $XSYNC_VM_DISK will be repartitioned and everything on it lost"
+
+log "rebuilding unattend media"
+"$XSYNC_ROOT/tools/xsync-make-unattend" >/dev/null || die "could not build the unattend ISO"
+
+log "defining the VM with the install profile"
+if $VIRSH domstate "$XSYNC_VM_NAME" 2>/dev/null | grep -q running; then
+    if (( RESTART )); then
+        log "stopping the running VM"
+        $VIRSH destroy "$XSYNC_VM_NAME" >/dev/null 2>&1
+        sleep 2
+    else
+        die "VM is already running (pass --restart to start over)"
+    fi
+fi
+"$XSYNC_ROOT/tools/xsync-setup" vm install >/dev/null || die "could not define the VM"
+
+log "starting the VM"
+$VIRSH start "$XSYNC_VM_NAME" >/dev/null || die "could not start the VM"
+
+# The prompt appears a few seconds after firmware hand-off and lasts ~5s. Sending
+# Enter once a second for half a minute covers it regardless of host load, and
+# extra keypresses are harmless: setup ignores Enter on the screens that follow
+# because the answer file drives them.
+log "sending Enter to get past the boot prompt"
+for _ in $(seq 1 30); do
+    $VIRSH send-key "$XSYNC_VM_NAME" KEY_ENTER >/dev/null 2>&1
+    sleep 1
+done
+
+log "VM console: $($VIRSH vncdisplay "$XSYNC_VM_NAME" 2>/dev/null)"
+log "install running headlessly; the TV is unaffected"
+
+if (( WATCH )); then
+    log "watching install progress (Ctrl-C to stop watching; the install continues)"
+    last=""
+    while $VIRSH domstate "$XSYNC_VM_NAME" 2>/dev/null | grep -q running; do
+        used="$(du -h "$XSYNC_VM_DISK" 2>/dev/null | cut -f1)"
+        if [[ "$used" != "$last" ]]; then
+            log "disk written: $used"
+            last="$used"
+        fi
+        sleep 30
+    done
+    log "VM stopped"
+else
+    cat <<EOF
+
+Watch progress with:
+  sudo tools/xsync-install-windows --watch     (disk usage)
+  sudo virsh screenshot $XSYNC_VM_NAME /tmp/vm.ppm   (see the screen)
+
+EOF
+fi
