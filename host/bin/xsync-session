@@ -107,11 +107,36 @@ start_exit_monitor() {
         # the parent is gone and blocks xsync-recover and the display watcher.
         exec 9>&-
 
-        sleep "$grace"
+        # Start polling NOW; the grace gates the DECISION to end a session, not
+        # the observation of one.
+        #
+        # This used to `sleep "$grace"` — 180s — before its first poll, which
+        # meant a session that ended inside that window was never observed at
+        # all. The guest's watcher powers Windows off within seconds of the game
+        # exiting, so the monitor would wake to a VM that was already gone,
+        # having never seen `playing` go false and therefore never having taken
+        # the `misses == 1` capture below.
+        #
+        # That capture is the ONLY one that can see a game installed during the
+        # session: the launch capture predates the install, and the teardown one
+        # runs after the guest has powered off (hence the permanent "could not
+        # re-enumerate games at teardown"). So the single most common workflow —
+        # open the Xbox app, install something, quit — silently failed to reach
+        # Steam whenever the session was shorter than the grace. Measured on
+        # 29 Jul: monitor armed 12:13:36, guest gone by 12:15:00, zero polls, no
+        # final capture. The guest side of the same event reads "host never
+        # collected the final game list - shutting down anyway".
+        #
+        # Polling during the grace is safe because every action below is already
+        # gated on `seen`, which only becomes 1 after a genuine `playing` reading.
+        # A slow-loading game still cannot be mistaken for one that has exited.
+        grace_until=$(( $(date +%s) + grace ))
         misses=0
         seen=0
         recap=0
         dlpoll=0
+        playing_now=0
+        captured_final=0
         rm -f "$XSYNC_STATE_DIR/captured"
 
         # /run survives between sessions, so a stale 1 from last night would
@@ -129,7 +154,9 @@ start_exit_monitor() {
         #
         # If nothing has ever been seen playing within this window, there is
         # nothing to supervise and the session should end.
-        never_seen_deadline=$(( $(date +%s) + ${XSYNC_LAUNCH_GRACE:-300} ))
+        # Measured from the END of the grace, not from now, so removing the
+        # blocking sleep above does not quietly shorten this by 180s.
+        never_seen_deadline=$(( grace_until + ${XSYNC_LAUNCH_GRACE:-300} ))
 
         # Notice when Windows restarts underneath us, and re-arm.
         #
@@ -171,13 +198,12 @@ start_exit_monitor() {
                 "$BIN/vm.sh" alive && { "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || true; }
                 break
             fi
+            playing_now=0
             if "$BIN/guest.sh" playing >/dev/null 2>&1; then
+                playing_now=1
                 seen=1
                 misses=0
-            elif (( seen )); then
-                # Only trust "stopped" once we have seen it running at least once.
-                misses=$(( misses + 1 ))
-
+            else
                 # Take the final game list on the FIRST sign the session ended,
                 # while the guest is provably still up.
                 #
@@ -187,7 +213,26 @@ start_exit_monitor() {
                 # the domain is gone. The guest is holding its shutdown open
                 # waiting for the marker we write back here, so this is a real
                 # window, not a race we are hoping to win.
-                if (( misses == 1 )); then
+                #
+                # Fires on `seen` OR the guest saying the session is over --
+                # and NOT on "not playing" alone.
+                #
+                # Two failure modes to thread between. Gating purely on `seen`
+                # missed a game that exited before the monitor's first poll:
+                # measured 29 Jul, game gone 12:44:10, monitor armed 12:44:18,
+                # guest answered not-playing at :19, :36 and :53, host did
+                # nothing, guest gave up with "host never collected the final
+                # game list". But firing on any not-playing reading is worse in a
+                # subtler way: "not playing" is also true for the whole launch
+                # window before the game appears, so a slow-loading game would
+                # spend this one-shot capture before the user had installed
+                # anything, and the snapshot that matters would never be taken.
+                #
+                # `guest.sh ended` is the unambiguous signal -- only the guest
+                # watcher sets ended_at, and only once the game has actually
+                # gone. Ending the session is still gated on `seen` below.
+                if (( ! captured_final )) && { (( seen )) || "$BIN/guest.sh" ended >/dev/null 2>&1; }; then
+                    captured_final=1
                     if capture_games >/dev/null 2>&1; then
                         log "final game list captured"
                     else
@@ -200,7 +245,11 @@ start_exit_monitor() {
                         'C:\ProgramData\xsync\captured' >/dev/null 2>&1 || true
                 fi
 
-                if (( misses >= needed )); then
+                # Only trust "stopped" enough to END the session once the game
+                # has actually been seen running.
+                (( seen )) && misses=$(( misses + 1 ))
+
+                if (( seen )) && (( misses >= needed )); then
                     log "game is no longer running — ending the session"
                     "$BIN/guest.sh" shutdown >/dev/null 2>&1 || true
                     sleep 45
@@ -225,10 +274,30 @@ start_exit_monitor() {
             # decides what appears in Steam. Every three minutes costs one cheap
             # enumeration and makes the list current however the session ends,
             # including a guest that powers itself off without warning.
+            #
+            # NOT while a game is actually on screen, though. `guest.sh games`
+            # runs the enumeration as a scheduled task in the interactive
+            # session at RunLevel Highest, and starting an elevated task there
+            # takes the foreground away from whatever is running. Forza pauses
+            # itself the moment it loses focus, and the user hit exactly that
+            # prompt mid-race; this task is the only thing xsync puts into the
+            # interactive session during play, so it is the cause on the balance
+            # of evidence -- though the focus theft itself has not been observed
+            # directly. It also walks every installed package measuring directory
+            # sizes: ~7s measured, not free, and not something to do underneath a
+            # game when nothing needs it there.
+            #
+            # Nothing is lost by waiting: installing a game happens from the Xbox
+            # app, which is a not-playing state and still re-captures, and the
+            # capture on the first sign of exit below catches the rest.
             recap=$(( recap + 1 ))
             if (( recap >= 12 )); then
-                recap=0
-                capture_games >/dev/null 2>&1 || true
+                if (( playing_now )); then
+                    recap=$(( recap - 1 ))   # retry once play stops
+                else
+                    recap=0
+                    capture_games >/dev/null 2>&1 || true
+                fi
             fi
 
             # Same problem as the re-capture above, same fix.
@@ -502,7 +571,50 @@ main() {
     # launch fired in that gap fails with "no interactive user is logged on"
     # -- a warning only, so the session carries on and the user is left at the
     # Xbox app with the game never started.
-    "$BIN/guest.sh" wait-user || warn "no interactive session — the launch will probably fail"
+    # Abort, do not press on. Continuing here is what leaves a black television.
+    #
+    # By this point the host session is stopped and the GPU belongs to the VM, so
+    # the TV is showing a guest that never reached a desktop: black, with no way
+    # back and no Steam to return to. Carrying on only made that worse. The
+    # launch fails with "no interactive user is logged on" (a warning), the
+    # session enters RUNNING anyway, and the host then waits out the exit
+    # monitor's 180s grace plus the 300s no-game deadline before recovering. Add
+    # the 300s already spent here and that is up to THIRTEEN MINUTES of black
+    # screen for a launch that could not possibly have worked.
+    #
+    # It is not hypothetical and it is not rare. It stranded a real session on
+    # 28 Jul at 21:12 -- the user force-power-cycled the machine rather than wait,
+    # which is the only sensible response -- and it reproduced twice unprompted
+    # during testing on 29 Jul.
+    #
+    # `die` trips the EXIT trap, and DISMANTLED is already set, so recovery stops
+    # the VM, reclaims the GPU and restores gaming mode. The TV comes back in
+    # about fifteen seconds instead of thirteen minutes. A failed launch the user
+    # can retry beats a black screen they have to hard-reset.
+    # Reboot once before giving up. This failure is a boot race, not a
+    # configuration fault, and a second boot almost always works.
+    #
+    # Measured across 37 guest boots on 29 Jul: exactly two never reached a
+    # desktop, and those two are the ONLY boots that logged **zero** Winlogon
+    # events. Every other boot logged between one and seven. So Windows starts,
+    # the drivers load, and Winlogon then never runs the logon at all — nothing
+    # to do with autologon being misconfigured or merely slow, and nothing xsync
+    # can influence from outside. Roughly a 5% chance per boot, which is often
+    # enough to be the most common way a launch fails.
+    #
+    # Retrying costs ~25s of black screen against a ~1-in-20 launch failure, and
+    # it turns two independent 5% events into 0.25%. Exactly one retry: a guest
+    # that cannot log on twice has something genuinely wrong with it, and a
+    # reboot loop behind a black television is far worse than an honest abort.
+    if ! "$BIN/guest.sh" wait-user; then
+        warn "no interactive desktop — rebooting the guest once and retrying"
+        "$BIN/vm.sh" stop || "$BIN/vm.sh" kill || true
+        "$BIN/vm.sh" start || die "guest would not restart after a failed logon"
+        "$BIN/guest.sh" wait || die "guest never became reachable after the retry reboot"
+        "$BIN/guest.sh" wait-user \
+            || die "the guest never reached an interactive desktop after a retry — aborting and restoring the host session"
+        log "interactive desktop reached on the second boot"
+    fi
 
     # Maintenance is a "game" only in the sense that Steam launches it.
     #

@@ -7,7 +7,15 @@ Wants=libvirtd.service
 [Service]
 Type=oneshot
 Environment=XSYNC_ROOT=/var/lib/xsync/app
-ExecStart=/var/lib/xsync/app/host/bin/xsync-maintain
+
+# Same reasoning as xsync-session@.service: maintenance boots the guest and can
+# run for the better part of an hour (XSYNC_MAINTENANCE_TIMEOUT defaults to
+# 3600s) driving a GPU driver install. A host suspend part-way through that is a
+# good way to corrupt an in-flight driver update, and nothing else on this
+# machine holds a `block` inhibitor.
+ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep --mode=block --who=xsync \
+    --why="guest maintenance in progress" \
+    /var/lib/xsync/app/host/bin/xsync-maintain
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=xsync-maintain

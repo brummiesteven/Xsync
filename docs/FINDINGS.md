@@ -44,12 +44,21 @@ qemu-guest-agent runs everything as Local System. These all fail there, silently
 |---|---|---|
 | AppX registration | `0x80073CF9` "not allowed" | user session, **elevated** |
 | `Get-AppxPackage` | returns almost nothing | user session |
-| `Get-AppxPackageManifest` | no AUMID → every game skipped | user session, **elevated** |
+| `Get-AppxPackageManifest` | no AUMID → every game skipped | user session (elevation **not** required — see below) |
+| `Get-AppxPackage -AllUsers` | terminating `UnauthorizedAccessException` | user session, **elevated** |
 | Launching a packaged app | task succeeds, no window appears | user session, **unelevated** |
 
 Elevation matters in **both** directions: UWP/MSIX apps refuse to launch from an
-elevated process, while AppX queries require admin. `Invoke-InUserSession` takes
-an explicit `-Elevated` switch for exactly this reason.
+elevated process, while some AppX queries require admin. `Invoke-InUserSession`
+takes an explicit `-Elevated` switch for exactly this reason.
+
+Be precise about *which* queries, though — an earlier version of this table said
+`Get-AppxPackageManifest` needed admin, and that is wrong. Measured on the guest
+from a Limited-token scheduled task, the manifest reads fine and Forza resolves to
+`Forzahorizon6`. The only admin-only call in the enumerator is
+`Get-AppxPackage -AllUsers`, and it throws *terminating*, so `-ErrorAction
+SilentlyContinue` does not contain it. Getting this wrong sent a whole debugging
+round in the wrong direction.
 
 ---
 
@@ -513,6 +522,488 @@ Worth noting what this cost to find: the game list was correct, the capture was
 running on schedule and writing `games.json` every three minutes, the sync ran
 cleanly and reported "0 added" — every component behaved exactly as designed, and
 the title still never appeared. Nothing was broken; the search space was.
+
+## The fix for that broke launching, because enumerate and launch want opposite privileges
+
+Finding Sunset Overdrive cost a regression, and the shape of it is worth keeping.
+
+Reaching WindowsApps titles needs `Get-AppxPackage -AllUsers`, which is
+admin-only. It went into `Get-InstalledXboxGames`. `enumerate` elevates
+deliberately, so it was tested and it worked — four games, correct AUMIDs.
+
+(An earlier version of this note also blamed `Get-AppxPackageManifest`. Measured
+on the guest from a Limited token, that one reads fine unelevated — Forza
+resolved to `Forzahorizon6`. `-AllUsers` is the whole story.)
+
+`launch` also called `Get-InstalledXboxGames`, and **launch must not elevate**:
+packaged apps refuse to start from an elevated process, which is why
+`Invoke-InUserSession` has an opt-in `-Elevated` switch in the first place. So
+the same function was now required to be elevated by one caller and required not
+to be by the other. Nobody launched a game between making the change and the
+evening, and the two callers do not fail the same way, so nothing caught it.
+
+Three separate things then went wrong in sequence, and only the first is the bug:
+
+1. **`-AllUsers` throws terminating.** `-ErrorAction SilentlyContinue` does not
+   suppress a terminating error, and the script sets `$ErrorActionPreference =
+   'Stop'`, so it propagated out of the function, out of the launch dispatch, and
+   killed the user-session task about two seconds in. The host saw
+   `result 1`, logged `launch request failed — leaving the guest at the Xbox
+   app`, and the TV showed the launcher. That much looked like a bad slug.
+2. **No state was written, so the backstop misfired.** `Save-State` is after the
+   resolve, so it never ran. `status` reads state, found none for this boot, and
+   reported `playing:false` unconditionally. The host waits to see `playing:true`
+   once before it will supervise anything, so `seen` stayed 0 — and the
+   no-game-ever-started deadline fired 300s after the 180s grace and powered the
+   VM off. The user had started Forza by hand from the launcher, which is the
+   obvious thing to do, and got about eight minutes before a hard shutdown. Twice.
+3. **The periodic re-enumeration ran in the interactive session mid-game.**
+   `guest.sh games` runs there at `RunLevel Highest`, every ~7 minutes. Forza
+   pauses on focus loss and the user hit that prompt mid-race, and this task is
+   the only thing xsync puts into the interactive session during play — so it is
+   the cause on the balance of evidence, though the focus theft has not been
+   observed directly. Cost measured end to end: ~7s, not free.
+
+What was changed:
+
+- `Get-XboxGamesFromRoot` is split out: `C:\XboxGames` only, no `-AllUsers`, no
+  directory sizing, no elevation needed. `Get-InstalledXboxGames` is now that
+  plus the WindowsApps sweep, and it checks `Test-IsElevated` first and degrades
+  with a warning instead of throwing.
+- Launch no longer enumerates. `Resolve-GameById` reads the pre-resolved
+  `launch-target.json`, then cached `games.json`, then falls back to the cheap
+  scan. The SYSTEM half of the launch dispatch resolves the AUMID *before*
+  dropping to the user session and leaves the answer in `launch-target.json`,
+  matched on id so a leftover from another game is ignored.
+- `status` reports `playing:true` when a game process is running even with no
+  state for this boot. Game processes only, never the launcher, so an idle guest
+  still lets the backstop fire. `Get-AnyXboxGameProcess` now also matches the
+  install paths in `games.json`, not just `C:\XboxGames`, or a manually started
+  Sunset Overdrive would be invisible to exactly the same failure.
+- The host skips its periodic re-capture while a game is playing, and takes it
+  the moment play stops.
+
+**The diagnostic gap mattered as much as the bug.** A scheduled task returns
+`LastTaskResult` and nothing else, so every failure in the user session reached
+the host as the bare string `result 1`. The real exception went to the guest's
+`agent.log` — inside a VM that the failure then caused to be powered off, on a
+machine where reading that file means booting the maint profile. The host log
+could not say why, only that it failed. `Invoke-InUserSession` now wraps the
+target in a `try/catch` that spools the error to `<script>-error.txt`, which the
+SYSTEM side reads back and folds into the message the host prints. An unelevated
+`-AllUsers` would have named itself in the host log on the first attempt.
+
+The general lesson: a helper whose privilege requirement changed is a breaking
+change to every caller, and the callers here had *contradictory* requirements.
+`sudo tools/xsync-test run safe` does not launch a game, so it cannot see this —
+after any change to enumeration or launch, an actual handoff has to be run.
+
+## ConvertFrom-Json does not enumerate on PowerShell 5.1, and it cost a launch
+
+The fix above replaced the launch path's enumeration with a cached lookup:
+
+```powershell
+$hit = @(Get-Content $cache -Raw | ConvertFrom-Json) |
+       Where-Object { $_.id -eq $Id } | Select-Object -First 1
+```
+
+That is wrong on the guest, and it is wrong in a way that produces no error.
+
+**Windows PowerShell 5.1's `ConvertFrom-Json` writes a JSON array to the pipeline
+as a single `Object[]`, without enumerating it.** So `Where-Object` receives one
+item — the entire four-game array. `$_.id` on an array is *member enumeration*,
+which yields all four ids; `@('a','b','c','d') -eq 'forza-horizon-6'` returns the
+matching element, which is truthy; the filter therefore passes the whole array
+through, and `Select-Object -First 1` faithfully returns it. One "game" whose
+`.aumid` is four AUMIDs.
+
+Nothing throws. The AUMIDs get joined with spaces and the launch runs:
+
+```
+explorer.exe shell:appsFolder\<aumid> <aumid> <aumid> <aumid>
+```
+
+and `explorer.exe` **silently activates the first one**. Confirmed in the guest's
+own event log — the two failed Forza launches show:
+
+```
+2026-07-29 09:06:39  id=1621  Activation of app
+  Xbox360BackwardCompatibil.PrimaryConkerLiveReloade_ksqcvrsvwz2jp!App attempted
+```
+
+The host had asked for Forza. Windows started Conker. The watcher then reported
+"game never started within the grace period" — because the game the host was
+watching for genuinely never started.
+
+**pwsh 7 enumerates; Windows PowerShell 5.1 does not.** The resolver was unit
+tested on the host against the real `games.json` and passed cleanly, because the
+host has pwsh 7. This is the same trap already recorded above for BOM-less UTF-8:
+*parse-checking and testing under pwsh is necessary but not sufficient*. Anything
+that depends on pipeline or type semantics has to be exercised under 5.1, and the
+`maint` profile makes that cheap — lift the function out of the installed agent
+with the AST and run it in the guest:
+
+```powershell
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+          'C:\Program Files\xsync\xsync-agent.ps1', [ref]$t, [ref]$e)
+Invoke-Expression $ast.Find({ param($x)
+    $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $x.Name -eq 'Resolve-GameById' }, $true).Extent.Text
+```
+
+Fixes: `Read-GameList` parses with an explicit `foreach`, which enumerates
+correctly under both; `Resolve-GameById` refuses to return anything whose `aumid`
+is an array; `Start-PackagedApp` refuses an AUMID containing whitespace.
+
+## Launching by AUMID must not go through explorer.exe
+
+`Start-Process explorer.exe shell:appsFolder\<aumid>` is fire-and-forget. It
+reports success whatever happens, it hands back no process id, and — as above —
+it will quietly take the first of four AUMIDs rather than reject the string.
+Every launch failure in this project has therefore looked identical from the
+host: "launched", nothing on the TV, watcher times out.
+
+`IApplicationActivationManager::ActivateApplication` returns an HRESULT **and**
+the new process id:
+
+```powershell
+[ComImport, Guid("2e941141-7f97-4756-ba1d-9decde894a3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IApplicationActivationManager {
+  [PreserveSig] int ActivateApplication(string appUserModelId, string arguments,
+                                        uint options, out uint processId);
+}
+// CLSID 45BA127D-10A8-46EA-8AB7-56EA9078943C
+```
+
+Verified in the guest — the log line is now the whole answer:
+
+```
+launching Forza Horizon 6 [Microsoft.ForteBaseGame_8wekyb3d8bbwe!Forzahorizon6]
+activated Forza Horizon 6 [...] -> pid 3172
+```
+
+and the documented chain follows: `gamelaunchhelper` → `gamingservicesui` →
+`xgamehelper` → `forzahorizon6.exe`. The explorer call is kept only as a
+fallback when the COM helper cannot be compiled.
+
+Useful corollary for diagnosis: this also works from an **elevated** context,
+where `explorer.exe shell:appsFolder\` does not. So a launch can be tested from
+the `maint` profile over `guest.sh run-user` without a handoff at all.
+
+Three things to know before relying on it:
+
+- **The returned pid is `gamelaunchhelper.exe`, not the game.** Every MSIXVC
+  title declares that stub as its manifest entry point (the real binary stays
+  encrypted under Flat File Install, so it cannot be the manifest `Executable`).
+  It hands off to the PC Bootstrapper, `GamingServicesUI.exe`, which starts the
+  game as *its* child and then exits. Tracking the returned pid for liveness
+  would report every game as having exited seconds after starting. Lifetime
+  tracking stays with `Get-GameProcesses` and the install-directory scan — which
+  is also what Playnite settled on, for the same reason.
+- **`ActivateApplication` has two documented preconditions that a headless VM can
+  easily lose**: UAC must be enabled, and the resolution must be at least
+  1024x768. Worth remembering before blaming a title.
+- **The bootstrapper exits silently and successfully in cases that are not
+  failures at all** — notably when the game is already running, where it
+  foregrounds the existing window and starts nothing. A stale game process from a
+  wedged previous session therefore looks exactly like a launch that did nothing.
+
+Still worth doing, and not yet done: enable process auditing in the guest image.
+
+```powershell
+auditpol /set /subcategory:"Process Creation"    /success:enable /failure:enable
+auditpol /set /subcategory:"Process Termination" /success:enable /failure:enable
+```
+
+Security events 4688/4689 then record whether `gamelaunchhelper.exe` started,
+whether `GamingServicesUI.exe` followed, whether the game exe was ever created,
+and with what exit status each died. There is **no GamingServices log file and no
+ETW provider for it** — that was searched for specifically and does not exist —
+so this is the only way to see inside that chain on a retail guest. The supported
+alternative, `wdapp launch <AUMID> WaitToExit log show all`, returns a real
+`launchResult` HRESULT and the game's exit code, but `wdapp.exe` ships with the
+GDK and needs Developer Mode, so it is not present on this guest.
+
+## The screenshot tool captured a corner of the screen, and nobody noticed
+
+`docs/screenshots/02-game-running.jpg` is 1600x900 of bamboo forest with no car,
+no HUD and nothing identifying it as a game. It was not a bad crop chosen by a
+human — the capture tool produced it.
+
+`xsync-screenshot.ps1` asked `[System.Windows.Forms.Screen]::PrimaryScreen.Bounds`
+how big the display was and handed that rectangle to `CopyFromScreen`. PowerShell
+is not DPI aware by default, so **Bounds returns DPI-virtualised pixels while
+CopyFromScreen works in physical ones**. On this guest — a 3840x2160 TV at 300%
+scaling — Bounds reports `1280x720`, exactly 3840/3 by 2160/3, and the capture is
+a 1280x720 rectangle taken from the physical origin. A corner of the frame,
+correctly exposed and in focus, which is precisely why it survived review: it
+looks like a screenshot, just of the wrong 1/9th of the screen.
+
+Fixed by making the process DPI aware before any screen query
+(`SetProcessDpiAwarenessContext` with per-monitor-v2, falling back to
+`SetProcessDPIAware`). Verified: captures went from `1280,720` to `3840,2160`.
+
+**But the tool still cannot photograph this guest.** The existing caveat says a
+game in exclusive fullscreen captures as black because GDI cannot see a
+flip-model swapchain. Measured 29 Jul, that is broader than stated: with FSE
+active, a full-frame 3840x2160 capture came back uniformly black (mean
+brightness 17.4) for **Forza and for the Xbox home app**. Under the Xbox full
+screen experience there is nothing GDI can see.
+
+Two things follow. A black capture is now genuinely diagnostic — it confirms the
+title is on the real GPU in exclusive fullscreen rather than sitting on a desktop.
+And any screenshot of the actual television has to be a photograph; the guest
+cannot take one of itself while FSE is on.
+
+## A paused download is not "no download"
+
+`Test-DownloadActive` had two signals: Delivery Optimization jobs that are
+actively transferring, and growth of `C:\XboxGames` across a six-second sample.
+Both measure **bytes moving right now**. Neither notices an install that is
+staged, unfinished, and momentarily idle — which is the exact state a download is
+left in by the thing this feature exists to survive.
+
+Measured 29 Jul, reinstalling Conker (4.85 GB):
+
+```
+14:44  install started in maint, staging folder at 0.24 GB
+14:45  profile switched to play, guest rebooted -- transfer stops
+14:46  session quit 60s after boot; `downloading` answers NO
+       -> teardown starts no watcher, session ends
+14:48  guest booted by hand for other work: staging folder now 3.12 GB
+```
+
+The download had simply not resumed yet. Game Pass can take minutes to re-queue a
+transfer after a boot, and for that whole window an unfinished install is
+invisible. The user's download survived only because the guest happened to be
+started again for an unrelated reason.
+
+The durable signal is the staging directory: Game Pass installs into a
+GUID-named folder under `C:\XboxGames` and renames it to the title only on
+completion. Its presence means an install is unfinished regardless of whether
+bytes are moving, so `Test-DownloadActive` now checks for it first:
+
+```powershell
+$staging = @(Get-ChildItem $root -Directory -EA SilentlyContinue |
+             Where-Object { $_.Name -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-' })
+if ($staging.Count -gt 0) { return $true }
+```
+
+Verified: with the folder present at 4.55 GB and nothing transferring,
+`guest.sh downloading` went from `no` to `yes`.
+
+A leftover folder from a cancelled install will now keep the guest up until the
+watcher's own ceiling expires. That is the safe direction to fail: the cost is
+some idle headless uptime, against silently discarding a part-finished download.
+
+## `clock offset='localtime'` broke Store licensing, and only for one game
+
+Sunset Overdrive would not launch. `explorer.exe shell:appsFolder\<aumid>`
+appeared to succeed and no process ever started. Asking the activation manager
+directly gave the real answer:
+
+```
+HRESULT = 0x80070BFF
+  "The caller specified wait timed out before the operation completed
+   because a licensing operation is being performed"
+```
+
+Nine consecutive attempts over two hours, across two Xbox app instances, all
+identical — while **Forza activated cleanly seconds later in the same session**.
+Everything obvious checked out: all packages `Status=Ok`, MSA signed in, Gaming
+Services healthy, `licensing.mp.microsoft.com` reachable on 443, NLM online.
+
+The cause was the guest clock, three hours in the future:
+
+```
+host true UTC : 09:10:00      (host TZ Asia/Muscat, +04)
+guest UTC     : 12:10:03      (guest TZ Europe/London, +01)
+```
+
+`<clock offset='localtime'/>` hands the guest the host's **wall-clock** time,
+which the guest then interprets in **its own** timezone. Host local 13:10 +04
+became guest local 13:10 BST, i.e. a guest UTC of 12:10 against a true UTC of
+09:10. Store licence validation is time-sensitive, so acquiring a fresh licence
+failed; every other title in the library already had a cached licence and was
+therefore unaffected, which is exactly what made this look title-specific.
+
+Correcting the clock at runtime and retrying:
+
+```
+guest UTC now: 2026-07-29 09:10:28
+attempt 1: HRESULT=0x00000000 PID=1236
+  Sunset.exe running: 1  responding=True
+```
+
+First attempt, after nine failures. Fixed permanently with the standard pair —
+`<clock offset='utc'/>` in the domain plus `RealTimeIsUniversal=1` in the guest
+(`HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation`), added to
+`xsync-firstboot.ps1`. Both halves are required: `offset='utc'` alone makes
+Windows read a UTC RTC as local time and the guest is then wrong by its timezone
+offset instead. Verified across a cold boot — guest UTC matches the host to the
+second and the guest still displays UK local time.
+
+Two things worth carrying forward. A host and guest in **different timezones** is
+the trigger; on a machine where they match, `localtime` hides the bug completely.
+And "one game fails, the rest work" is a licence-cache artefact, not evidence
+that the game is special — the failing one is simply the one that needed a fresh
+licence.
+
+## Why a game installed during a session never reached Steam
+
+The library sync had never worked on its own — every game in Steam had been put
+there by running the sync by hand. Three defects stacked, and the third is the
+one that mattered.
+
+**The design.** Three chances to capture the installed-game list:
+
+| capture | when | can it see a game installed this session? |
+|---|---|---|
+| launch | just after `phase: RUNNING` | no — it predates the install |
+| periodic | every ~12 polls while the guest is up | only if the session runs long enough |
+| **`misses == 1`** | the instant the host sees play stop | **yes — this is the one that matters** |
+| teardown | after `vm.sh wait` returns | no — the guest has already powered off |
+
+The teardown capture can never work and is not supposed to; that is why
+`could not re-enumerate games at teardown` appears in essentially every session
+and is only a warning. The guest cooperates with the `misses == 1` capture by
+holding its shutdown open for `XSYNC_EXIT_GRACE_SECONDS` (45s) waiting for the
+host to write a `captured` marker back.
+
+**Defect 1 — the exit monitor slept through its own grace.** It opened with
+`sleep "$grace"` (180s) *before its first poll*. The guest's watcher powers
+Windows off within seconds of a game exiting, so any session shorter than the
+grace was never observed at all: no poll, no `misses`, no capture. Measured
+29 Jul — monitor armed 12:13:36, guest gone 12:15:00, zero polls. Fixed by
+polling from the start and letting the grace gate only the *decision* to end a
+session; every action was already gated on `seen`, so a slow-loading game still
+cannot be mistaken for one that exited.
+
+**Defect 2 — `status` reported `playing:true` forever after a game exited.**
+This is the root cause. When a game ends the watcher records:
+
+```powershell
+Save-State @{ playing = $false; ended_at = (Get-Date).ToString('o') }
+```
+
+That record has **no `install_path`**, so the `status` arm fell past its
+game-process branch into the Xbox-app branch — which answers "is XboxPcApp
+running?". It always is. So the host was told the game was still playing for the
+entire shutdown, `misses` never incremented, the marker was never written, and
+the guest gave up after its 45s (`host never collected the final game list -
+shutting down anyway`). `status` never consulted `$state.playing` at all — the
+one field that states plainly that the session is over.
+
+Fixed by checking for `ended_at` / an explicit `playing = $false` **before** any
+live process check.
+
+**Defect 3 — DLC counted as games.** Unrelated to sync timing, but it would have
+made the first successful sync worse than the failure. See the next section.
+
+The lesson worth keeping: the capture that mattered was the one that only fires
+on a state transition the host could not observe, guarded by a grace period that
+guaranteed it would not be observed. Two independent bugs, each of which alone
+was enough to break it, in the one path with no test coverage — because
+`xsync-test` cannot launch a game, and every manual test ended with
+`systemctl stop`, which goes through `recover()` and deliberately skips
+`SYNC_LIBRARY` entirely.
+
+## FSE was already switched on, and the docs said it was not
+
+Worth knowing before reading the next section: `STATE.md` claimed
+`xsync-fse.ps1` was "written and parse-checked but deliberately **not**
+applied". That was untrue from 27 Jul onwards. Measured on the guest on 29 Jul:
+
+```
+IsGamingFullScreenExperienceActive()                = True
+HKLM\...\CurrentVersion\OEM\DeviceForm              = 46     (gaming handheld)
+GamingConfiguration\GamingHomeApp                   = Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App
+GamingConfiguration\StartupToGamingHome             = 1
+FeatureManagement\Overrides                         = 2745 keys
+```
+
+`C:\ProgramData\xsync\fse.log` records four runs on **27 Jul**; the first, at
+10:24:58 against build 26200.8037, failed every flag with `NTSTATUS 0xC000000D`,
+and the last at 15:10:14 on 26200.8875 reported enabling 52580392, 50902630 and
+59765208 cleanly.
+
+**The script is not why FSE is on, though.** The operator enabled Xbox mode by
+hand in Settings. The giveaway is `StartupToGamingHome=1`: it is set on the guest,
+and `xsync-fse.ps1` never writes that value anywhere. So the script may have
+contributed `DeviceForm` and the feature flags, but its ability to enable FSE
+unaided is **unverified** — and it writes `TaskSwitcherNexusInjectionEnabled` to a
+literal `HKCU:`, which under guest-exec is the SYSTEM hive rather than the
+player's, so at least one of its per-user writes definitely does not land. Pressing Win in the guest now raises the FSE task switcher, with
+`Ⓐ Select / ✕ Close` prompts and an "Xbox mode / Windows desktop" toggle.
+
+Two things follow. First, `IsGamingFullScreenExperienceActive` is the only
+trustworthy check — and note its signature: it returns `BOOL` **directly**, not
+an `HRESULT` with an out-parameter. Declaring it the wrong way returns 1 and an
+`active` value of `False`, which reads as "off" and is simply the return value
+being misinterpreted:
+
+```powershell
+[DllImport("api-ms-win-gaming-experience-l1-1-0.dll")]
+[return: MarshalAs(UnmanagedType.Bool)]
+public static extern bool IsGamingFullScreenExperienceActive();
+```
+
+Second, and the reason this matters operationally: Microsoft documents that under
+FSE **Windows takes exclusive ownership of the Guide button**. The Guide-button
+exit overlay listed under "Not yet done" in STATE.md therefore cannot work while
+FSE is on. The L3+R3 chord, read through Raw Input `RIDEV_INPUTSINK`, sits
+below that routing layer and should still work; neither has been exercised with a
+real controller.
+
+Also note the guest reports build **26200**.8875, not 26100.8875 — the 26100 in
+`$PSVersionTable.PSVersion` is the PowerShell build, not the OS. Reading the OS
+build from PowerShell's version string will put you on the wrong side of the
+26200.8328 feature threshold.
+
+## Xbox Full Screen Experience is not why a game fails to launch
+
+Investigated properly rather than assumed, because "FSE is new and might be the
+blocker" is a natural suspicion and a very expensive one to chase.
+
+**It is not, and enabling it would make things worse.** Microsoft's GDK
+documentation describes FSE-inactive as *"the default state for games on
+Windows"* — every Game Pass title on every non-handheld PC launches with it off —
+and FSE is runtime-toggleable (Win+F11, no reboot), which a launch prerequisite
+could not be. There is no documented interaction between FSE and whether
+`shell:appsFolder\<AUMID>` activation succeeds.
+https://learn.microsoft.com/gaming/gdk/docs/gdk-dev/pc-dev/handheld/handheld-launchers
+
+Two documented reasons it would actively hurt this project:
+
+- **Windows takes exclusive ownership of the Guide button under FSE**, routing a
+  short press to Game Bar. Any Guide-based route is gone. (The L3+R3 chord
+  read via Raw Input `RIDEV_INPUTSINK` sits below that layer and should survive —
+  the Guide path would not.)
+- **The taskbar is hidden**, so a game that mishandles foreground transfer
+  becomes an invisible background window with nothing to rescue it — a failure
+  mode FSE *introduces*.
+
+Other things worth knowing if it is ever revisited: it is **not** SKU-gated
+(Windows 11 Pro is fine, all editions, 24H2+), the build floor is 26100.8328 and
+this guest is well past it, and it is delivered by Controlled Feature Rollout
+keyed on device identity — a passthrough VM presents as a generic desktop, so the
+Settings toggle may simply never appear. `DeviceForm = 0x2E` at
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\OEM` plus ViVeTool feature IDs
+is the community route, and Microsoft explicitly warns that a registry-set
+`DeviceForm` is not migrated across feature updates.
+https://support.microsoft.com/en-us/topic/windows-gaming-full-screen-experience-67fb8d12-5467-4a95-8adf-0a10789576ab
+
+Licensing was ruled out at the same time, and the check is one command — package
+status is the authoritative signal, and `Get-AppxPackage` succeeding is **not**
+the same thing:
+
+```powershell
+Get-AppxPackage -Name Microsoft.ForteBaseGame | Format-List Name,Status,Version
+# Status=Ok. 1 = LicenseIssue, 2 = Modified, 4 = Tampered, 8 = Disabled
+```
+
+All four titles reported `Status=Ok`, MSA signed in, clock correct, vTPM present
+and owned, SMBIOS UUID matching the domain. Nothing was wrong with the guest.
 
 ## Asking SteamGridDB for one exact size finds nothing
 

@@ -74,7 +74,18 @@
     <feature policy='require' name='topoext'/>
   </cpu>
 
-  <clock offset='localtime'>
+  <!-- UTC, not localtime, and the guest is told to read the RTC as UTC.
+       'localtime' hands the guest the HOST's wall-clock time, which the guest
+       then interprets in ITS OWN timezone. With the host on Asia/Muscat (+04)
+       and the guest on Europe/London (+01) that put the guest's notion of UTC
+       three hours into the future, and Microsoft Store licence validation is
+       time-sensitive: Sunset Overdrive failed to activate nine times running
+       with 0x80070BFF ("a licensing operation is being performed") and launched
+       first try once the clock was corrected. Nothing else in the library
+       noticed, because their licences were already cached.
+       Requires RealTimeIsUniversal=1 in the guest (set by xsync-firstboot.ps1),
+       or Windows reads this UTC value as local time instead. -->
+  <clock offset='utc'>
     <timer name='rtc' tickpolicy='catchup'/>
     <timer name='pit' tickpolicy='delay'/>
     <timer name='hpet' present='no'/>

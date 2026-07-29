@@ -97,6 +97,33 @@ Invoke-Step 'virtio guest tools' {
     }
 }
 
+Invoke-Step 'clock' {
+    # Read the RTC as UTC, matching <clock offset='utc'/> in the domain.
+    #
+    # Without this pair the guest takes the HOST's wall-clock time and reinterprets
+    # it in its own timezone. On the reference machine (host Asia/Muscat +04, guest
+    # Europe/London +01) that put the guest three hours ahead of real UTC, and it
+    # is not cosmetic: Microsoft Store licence validation is time-sensitive.
+    # Sunset Overdrive returned 0x80070BFF ("a licensing operation is being
+    # performed") on nine consecutive activations and launched on the first
+    # attempt once the clock was corrected. Titles whose licences were already
+    # cached were unaffected, which is what made it look title-specific.
+    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' `
+        -Name 'RealTimeIsUniversal' -Value 1 -Type DWord -Force
+    $v = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' `
+        -Name RealTimeIsUniversal -ErrorAction SilentlyContinue).RealTimeIsUniversal
+    if ($v -ne 1) { throw 'RealTimeIsUniversal did not stick' }
+    Say 'RealTimeIsUniversal=1'
+
+    # Belt and braces: keep it corrected even if the RTC drifts.
+    Set-Service -Name w32time -StartupType Automatic -ErrorAction SilentlyContinue
+    Start-Service -Name w32time -ErrorAction SilentlyContinue
+    w32tm /config /manualpeerlist:"time.windows.com,0x9" /syncfromflags:manual /update 2>&1 | Out-Null
+    w32tm /resync /force 2>&1 | Out-Null
+    $global:LASTEXITCODE = 0
+    Say ("guest UTC now {0}" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))
+}
+
 Invoke-Step 'power configuration' {
     # Fast startup makes "shutdown" a hibernate, which would leave the VM holding
     # the GPU. The host's whole lifecycle depends on a real power-off.

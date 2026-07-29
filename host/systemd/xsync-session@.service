@@ -20,7 +20,28 @@ TimeoutStartSec=infinity
 RemainAfterExit=no
 
 Environment=XSYNC_ROOT=/var/lib/xsync/app
-ExecStart=/var/lib/xsync/app/host/bin/xsync-session %i
+
+# Block idle sleep for the life of the session.
+#
+# Mid-handoff the GPU is bound to vfio-pci, the VM owns it, and sddm is stopped.
+# If the host suspends in that state the user is left with a black television, a
+# VM holding the card, and no session to come back to -- the one outcome this
+# whole project treats as unacceptable. GPU passthrough across a host suspend is
+# not something to find out about on a Wednesday evening.
+#
+# It is not hypothetical: on 29 Jul the host suspended (`PM: suspend entry
+# (deep)`) after ~29 minutes of an unattended guest operation, with nothing
+# holding it off. It happened to be on the maint profile, so it cost only time.
+#
+# Nothing else on this machine prevents it. HandheldDaemon, NetworkManager,
+# ModemManager and UPower all hold `delay` inhibitors, and libvirtd holds one for
+# `shutdown` only -- none of which stops an idle suspend. `block` does.
+#
+# Deliberately not blocking `shutdown`: a user who asks the machine to power off
+# should get that, and ExecStopPost already runs recovery.
+ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep --mode=block --who=xsync \
+    --why="handoff in progress: GPU is bound to the VM and the host session is torn down" \
+    /var/lib/xsync/app/host/bin/xsync-session %i
 
 # If systemd stops this unit, run the same recovery the script would.
 ExecStopPost=-/var/lib/xsync/app/host/bin/xsync-recover

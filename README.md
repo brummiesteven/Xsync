@@ -69,6 +69,15 @@ no added latency.
 
 ![Forza Horizon 6 loading](docs/screenshots/03-game-loading.jpg)
 
+> These two are framed oddly, and it is worth knowing why. They were taken by
+> `xsync-screenshot.ps1`, which asked Windows Forms for the screen size without
+> making itself DPI aware — so on a 4K display at 300% scaling it captured a
+> 1280x720 rectangle from the corner of the frame rather than the frame. That is
+> fixed (captures are now the full 3840x2160), but it cannot be used to retake
+> these: with the Xbox full screen experience active, GDI sees a flip-model
+> swapchain and every capture comes back black, for games *and* for the Xbox home
+> app. A real screenshot of the television has to be a photograph.
+
 Measured during play: **56-57% GPU at 2685 MHz, 225 W, 9.9 GB VRAM** at 4K Extreme
 settings — vsync-locked with headroom to spare.
 
@@ -225,17 +234,46 @@ generated locally by `tools/xsync-make-artwork` — nothing to download, nothing
   `C:\Program Files\WindowsApps` rather than `C:\XboxGames`, with nothing in the
   manifest marking them as games. They are identified by install size (1 GB floor,
   `XSYNC_MIN_GAME_BYTES`), so a very small title would be missed.
+- **Screenshots of the guest.** With the Xbox full screen experience on, GDI
+  capture returns black — the compositor is using a flip-model swapchain it cannot
+  see. `xsync-screenshot.ps1` still works on the `maint` profile, and a black
+  capture during play is itself useful: it means the title really is in exclusive
+  fullscreen on the passed-through GPU.
 
 ## Status
 
-This is **v0.1** and it has run on exactly one machine. Working and measured here:
-the handoff, the firmware blackout, the exit chord, GPU release and reclaim, library
-and artwork sync.
+This is **v0.2** and it has run on exactly one machine.
 
-Written and deployed but **not yet proven**: the headless download-resume watcher, the
-final-capture handshake on a manually shut-down guest, and the first-boot FSE step
-(this machine had FSE enabled by hand before that code existed). `tools/xsync-find-usb`
+Working and measured here: the handoff, the firmware blackout, GPU release and
+reclaim, library sync in **both** directions (installing a game adds it to Steam,
+uninstalling removes it), artwork sync, and the exit path — including the
+`Ctrl+Alt+Q` hotkey driving a real quit through the in-guest watcher, exercised
+repeatedly.
+
+v0.2 exists because v0.1's launch path was broken and its library sync had never
+worked unattended. Ten defects were found and fixed; `STATE.md` lists them and
+`docs/FINDINGS.md` explains each one. The ones most likely to matter to you:
+
+- Launching resolved games through a call that requires admin, from the one code
+  path that must not have it.
+- `ConvertFrom-Json` does not enumerate arrays on Windows PowerShell 5.1, so a
+  fix written and tested under pwsh 7 shipped a launch that started the wrong game.
+- `<clock offset='localtime'/>` put the guest's UTC hours into the future when the
+  host and guest are in different timezones, which breaks Microsoft Store licence
+  acquisition for any title whose licence is not already cached.
+- Game Pass DLC install as their own directories with their own
+  `MicrosoftGame.config`, so each add-on was appearing in Steam as a game.
+- Nothing stopped the host suspending mid-handoff, with the GPU bound to the VM.
+
+Written and deployed but **still not proven**: the headless download-resume watcher
+(its *detection* is now fixed and tested, but the watcher itself has never run to
+completion), and the first-boot FSE step — this machine had FSE enabled by hand,
+and `xsync-fse.ps1` is not known to be sufficient on its own. `tools/xsync-find-usb`
 has been tested against one topology.
+
+Known flaky: roughly 5% of guest boots never run Winlogon at all, so no desktop
+appears. xsync reboots the guest once and retries, which takes it to about 0.25%;
+the underlying race is a Windows one and is not fixed.
 
 Expect rough edges on hardware that is not a 7950X with a 4090.
 

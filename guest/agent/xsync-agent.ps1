@@ -47,6 +47,10 @@ $StateFile  = Join-Path $XsyncDir 'state.json'
 $LogFile    = Join-Path $XsyncDir 'agent.log'
 $GamesRoot  = 'C:\XboxGames'
 
+# Set by Invoke-InUserSession. Declared here because Set-StrictMode makes
+# reading an unassigned variable an error, and the failure paths read it.
+$LastUserSessionError = ''
+
 if (-not (Test-Path $XsyncDir)) { New-Item -ItemType Directory -Path $XsyncDir -Force | Out-Null }
 
 function Write-Log {
@@ -76,13 +80,25 @@ function ConvertTo-Slug {
 
 # ---------------------------------------------------------------- enumerate
 
+function Test-IsElevated {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
 <#
     Game Pass titles install to C:\XboxGames\<Title>\Content\, each with a
     MicrosoftGame.config naming the package identity and display name. That file
     is the authoritative source; Get-AppxPackage then resolves the package family
     name so we can build a launchable AUMID.
+
+    Split out from Get-InstalledXboxGames because this half is cheap and needs no
+    elevation, while the WindowsApps sweep below is the opposite of both. The
+    launch path resolves against this one; only `enumerate` pays for the rest.
 #>
-function Get-InstalledXboxGames {
+function Get-XboxGamesFromRoot {
     $games = @()
     if (-not (Test-Path $GamesRoot)) {
         Write-Log "no $GamesRoot - nothing installed yet"
@@ -117,6 +133,60 @@ function Get-InstalledXboxGames {
             continue
         }
 
+        # Skip DLC. Every add-on is its own directory with its own config.
+        #
+        # Installing Fallout 4 turned one Steam entry into SEVEN: the base game
+        # plus Automatron, Far Harbor, Nuka-World, Vault-Tec Workshop,
+        # Contraptions Workshop and Wasteland Workshop, because Game Pass lays
+        # each add-on down as C:\XboxGames\Fallout 4- <name>\Content\
+        # MicrosoftGame.config, exactly the shape this loop looks for.
+        #
+        # Size is not the discriminator -- Wasteland Workshop is 0.08 GB and
+        # Far Harbor is 5.2 GB, so any floor either keeps junk or drops real
+        # games. The config says so explicitly instead. Measured against a real
+        # install, a DLC differs from a game in four independent ways, and any
+        # one of them is sufficient:
+        #
+        #   base game (Fallout 4)          DLC (Fallout 4: Automatron)
+        #   ----------------------------   ------------------------------------
+        #   <ExecutableList> present       absent -- nothing to run
+        #   no TargetDeviceFamilyForDLC    <TargetDeviceFamilyForDLC>PC</>
+        #   no MainPackageDependency       <MainPackageDependency Name="..CoreGame"/>
+        #   manifest Applications: Game    manifest Applications: (none)
+        #
+        # That last one is also why these looked launchable: with no Applications
+        # node the app-id lookup below throws, the catch leaves $appId at its
+        # 'App' default, and the result is a well-formed AUMID
+        # (...DLC1Automatron_...!App) that matches no app at all. Six shortcuts
+        # that could never have started anything.
+        $dlcReason = $null
+        try { if ($cfg.Game.TargetDeviceFamilyForDLC) { $dlcReason = 'TargetDeviceFamilyForDLC' } } catch { }
+        if (-not $dlcReason) {
+            try {
+                if ($cfg.Game.DesktopRegistration -and $cfg.Game.DesktopRegistration.MainPackageDependency) {
+                    $dlcReason = "MainPackageDependency=$($cfg.Game.DesktopRegistration.MainPackageDependency.Name)"
+                }
+            } catch { }
+        }
+        if ($dlcReason) {
+            Write-Log "skipping add-on content '$display' ($dlcReason)"
+            continue
+        }
+
+        # A missing ExecutableList is NOT grounds for skipping.
+        #
+        # It was, briefly, as a third DLC test -- and that was wrong. The
+        # executable name is only used to find the game's process once it is
+        # running; launching goes through the AUMID and does not need it at all.
+        # A game whose config omits ExecutableList is therefore still perfectly
+        # launchable, and dropping it would silently lose a real title from the
+        # library to guard against something the two explicit markers above
+        # already catch (both fired for all six Fallout 4 add-ons). Warn instead,
+        # because exit detection will fall back to install-path matching.
+        if (-not $exeName) {
+            Write-Log "no ExecutableList for '$display' - exit detection will match on install path only" 'WARN'
+        }
+
         # Resolve the package family name and app id to build the AUMID.
         $aumid = $null
         try {
@@ -127,10 +197,33 @@ function Get-InstalledXboxGames {
                     $manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName -ErrorAction Stop
                     $app = $manifest.Package.Applications.Application
                     if ($app -is [array]) { $appId = $app[0].Id } else { $appId = $app.Id }
+
+                    # A package with no Applications node has nothing to
+                    # activate, and must not be given a fabricated AUMID.
+                    #
+                    # Reading .Id off a null Applications node throws under
+                    # StrictMode, the catch below leaves $appId at 'App', and the
+                    # result is a perfectly well-formed AUMID for an app that
+                    # does not exist. That is how six Fallout 4 add-ons became
+                    # six launchable-looking Steam shortcuts. Fail the entry
+                    # instead of inventing an id for it.
+                    # Deliberately a flag rather than `continue`: this sits inside
+                    # two nested try blocks, and letting the existing "no AUMID"
+                    # check below do the skipping keeps the control flow obvious.
+                    if ([string]::IsNullOrWhiteSpace($appId)) {
+                        Write-Log "no application id in the manifest for $identity - not launchable" 'WARN'
+                        $appId = $null
+                    }
                 } catch {
-                    Write-Log "manifest unreadable for $identity, assuming App" 'WARN'
+                    # Rare: the manifest reads fine from a Limited token on this
+                    # guest. If it ever does fail, the app id falls back to 'App',
+                    # which is right for some titles and silently wrong for others
+                    # (Forza's is 'Forzahorizon6'), and a wrong app id builds an
+                    # AUMID that launches nothing at all. Log the token state so
+                    # the cause is not a guess next time.
+                    Write-Log ("manifest unreadable for {0} (elevated={1}), assuming App" -f $identity, (Test-IsElevated)) 'WARN'
                 }
-                $aumid = "{0}!{1}" -f $pkg.PackageFamilyName, $appId
+                if ($appId) { $aumid = "{0}!{1}" -f $pkg.PackageFamilyName, $appId }
             }
         } catch {
             Write-Log "AppX lookup failed for ${identity}: $_" 'WARN'
@@ -148,6 +241,40 @@ function Get-InstalledXboxGames {
             install_path  = $dir.FullName
             executable    = $exeName
         }
+    }
+
+    Write-Log "found $($games.Count) game(s) under $GamesRoot"
+    return $games
+}
+
+<#
+    The full library: everything under C:\XboxGames, plus games the Store put
+    somewhere else.
+
+    REQUIRES ELEVATION, and callers must treat that as a hard precondition rather
+    than a nicety. `Get-AppxPackage -AllUsers` raises a TERMINATING error under a
+    standard-user token, and a terminating error is not suppressed by
+    -ErrorAction SilentlyContinue -- with $ErrorActionPreference = 'Stop' set at
+    the top of this script it propagates straight out of here and kills the
+    caller. That is exactly how the launch path broke: launch must run
+    unelevated (packaged apps refuse to start from an elevated process), it
+    called this function to resolve the game, and the whole user-session task
+    died with exit code 1 about two seconds in. The host reported "launch request
+    failed", left the guest sitting on the Xbox app, and -- because no session
+    state was ever written -- its exit monitor then decided no game had ever
+    started and powered the VM off five minutes later, mid-game.
+
+    So: `enumerate` calls this (it elevates deliberately). `launch` must not.
+#>
+function Get-InstalledXboxGames {
+    $games = @(Get-XboxGamesFromRoot)
+
+    if (-not (Test-IsElevated)) {
+        # Degrade instead of throwing. A caller that reaches here unelevated gets
+        # the C:\XboxGames titles and a loud log line, not a dead process.
+        Write-Log 'not elevated - skipping the WindowsApps sweep (Store-installed games will be missing)' 'WARN'
+        Write-Log "enumerated $($games.Count) game(s)"
+        return $games
     }
 
     # Second source: games the Store installed outside C:\XboxGames.
@@ -172,7 +299,16 @@ function Get-InstalledXboxGames {
     $seen = @{}
     foreach ($g in $games) { $seen[$g.aumid] = $true }
 
-    foreach ($pkg in @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)) {
+    # Belt and braces on top of the elevation check above: -AllUsers throws
+    # terminating, so SilentlyContinue alone is not a guard.
+    $allPkgs = @()
+    try {
+        $allPkgs = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+    } catch {
+        Write-Log "Get-AppxPackage -AllUsers failed: $_" 'WARN'
+    }
+
+    foreach ($pkg in $allPkgs) {
         if ($pkg.IsFramework) { continue }
         if (-not $pkg.InstallLocation) { continue }
         # System-signed packages are Windows itself, never a game.
@@ -226,16 +362,215 @@ function Get-InstalledXboxGames {
 
 # ---------------------------------------------------------------- launch
 
+<#
+    Activate a packaged app and get a REAL answer back.
+
+    `Start-Process explorer.exe shell:appsFolder\<aumid>` is fire-and-forget. It
+    reports success no matter what happens next, so a launch Windows refused is
+    indistinguishable from one that worked -- which is how every launch failure
+    in this project has presented: "launched", then nothing on the TV, then the
+    watcher giving up. It is also happy to be handed a string containing four
+    AUMIDs: it silently activates the FIRST one. That cost a whole debugging
+    round, with the host waiting on Forza while the guest had been told to start
+    Conker.
+
+    IApplicationActivationManager::ActivateApplication returns an HRESULT and the
+    new process id, so both can go straight in the log. Verified on the guest:
+    returns 0x00000000 and pid, and gamelaunchhelper -> gamingservicesui ->
+    xgamehelper -> forzahorizon6.exe follow.
+
+    Keeps the explorer path as a fallback, because a launch that cannot report
+    its status still beats no launch at all.
+#>
+function Initialize-Activator {
+    if ('Xsync.Activator' -as [type]) { return $true }
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace Xsync {
+  [ComImport, Guid("2e941141-7f97-4756-ba1d-9decde894a3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IApplicationActivationManager {
+    [PreserveSig] int ActivateApplication([MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+      [MarshalAs(UnmanagedType.LPWStr)] string arguments, uint options, out uint processId);
+  }
+  [ComImport, Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
+  public class ApplicationActivationManagerClass { }
+  public static class Activator {
+    public static int Activate(string aumid, out uint processId) {
+      var mgr = (IApplicationActivationManager)(new ApplicationActivationManagerClass());
+      return mgr.ActivateApplication(aumid, "", 0, out processId);
+    }
+  }
+}
+'@ -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Log "could not compile the activation helper: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+function Start-PackagedApp {
+    param([string]$Aumid, [string]$What)
+
+    # Refuse anything that is not one AUMID, rather than let the shell pick.
+    if ([string]::IsNullOrWhiteSpace($Aumid) -or $Aumid -match '\s') {
+        Write-Log ("refusing to activate a malformed AUMID for {0}: '{1}'" -f $What, $Aumid) 'ERROR'
+        return $false
+    }
+
+    if (Initialize-Activator) {
+        try {
+            $procId = [uint32]0
+            $hr = [Xsync.Activator]::Activate($Aumid, [ref]$procId)
+            if ($hr -eq 0) {
+                # That pid is gamelaunchhelper.exe, NOT the game. Every MSIXVC
+                # title declares gamelaunchhelper.exe as its manifest entry
+                # point; it hands off to the PC Bootstrapper
+                # (GamingServicesUI.exe), which starts the real binary as its
+                # child and then exits. So the pid is good for "activation
+                # really did create a process" and useless for "is the game
+                # still running" -- watching it would report the game as having
+                # exited seconds after it started. Lifetime tracking stays with
+                # Get-GameProcesses, which matches on the install directory.
+                Write-Log ("activated {0} [{1}] -> helper pid {2}" -f $What, $Aumid, $procId)
+                return $true
+            }
+            Write-Log ("activation of {0} [{1}] FAILED: HRESULT 0x{2:X8}" -f $What, $Aumid, $hr) 'ERROR'
+        } catch {
+            Write-Log ("activation of {0} threw: {1}" -f $What, $_.Exception.Message) 'WARN'
+        }
+    }
+
+    Write-Log ("falling back to explorer for {0} [{1}]" -f $What, $Aumid) 'WARN'
+    Start-Process 'explorer.exe' -ArgumentList ("shell:appsFolder\{0}" -f $Aumid)
+    return $false
+}
+
 function Start-XboxApp {
     Write-Log 'launching the Xbox app'
-    # shell:appsFolder is how the shell itself launches packaged apps.
-    Start-Process 'explorer.exe' -ArgumentList 'shell:appsFolder\Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App'
+    [void](Start-PackagedApp -Aumid 'Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App' -What 'the Xbox app')
+}
+
+<#
+    Resolve one game id to a launchable record, cheaply and without elevation.
+
+    The launch path cannot call Get-InstalledXboxGames: that needs admin (its
+    -AllUsers sweep throws UnauthorizedAccessException from a Limited token) and
+    launch must stay unelevated. Resolving from a cached list is also simply
+    cheaper than a full sweep, which measures the size of every installed package.
+
+    Two sources, cheapest first:
+
+      1. games.json, written by the last `enumerate`. That ran elevated, so its
+         AUMIDs are the correctly resolved ones, and it is the only source that
+         knows about WindowsApps-only titles like Sunset Overdrive.
+      2. A targeted scan of C:\XboxGames. No -AllUsers, no directory sizing.
+         Correct AUMIDs only when the caller happens to be elevated (SYSTEM is),
+         which is why the launch dispatch resolves before dropping privileges.
+#>
+<#
+    Parse a games.json into a REAL array, one element per game.
+
+    Windows PowerShell 5.1's ConvertFrom-Json hands a JSON array to the pipeline
+    as a single Object[] rather than enumerating it. So
+
+        @(Get-Content $f -Raw | ConvertFrom-Json) | Where-Object { $_.id -eq $Id }
+
+    does not filter four games down to one. Where-Object receives ONE item -- the
+    whole array -- and `$_.id` on an array is member enumeration, returning all
+    four ids; `@(...) -eq 'forza-horizon-6'` then matches, so the array passes the
+    filter intact and `Select-Object -First 1` faithfully returns all four games
+    as a single result.
+
+    The consequence is not a crash. `$game.aumid` becomes four AUMIDs, they get
+    joined into one string, and the launch runs
+
+        explorer.exe shell:appsFolder\<aumid> <aumid> <aumid> <aumid>
+
+    which matches no app, starts nothing, and reports success. The guest then sat
+    at the Xbox app until the watcher gave up: "game never started within the
+    grace period". Identical symptom to the -AllUsers bug, completely different
+    cause.
+
+    pwsh 7 DOES enumerate, so this passes every test run on the host and fails
+    only on the guest -- the same trap already recorded in FINDINGS for BOM-less
+    UTF-8. A `foreach` enumerates correctly under both, so use one.
+#>
+function Read-GameList {
+    param([string]$Path)
+    $games = @()
+    if (-not (Test-Path $Path)) { return $games }
+    $parsed = Get-Content $Path -Raw | ConvertFrom-Json
+    foreach ($g in @($parsed)) {
+        if ($null -ne $g) { $games += $g }
+    }
+    return $games
+}
+
+function Resolve-GameById {
+    param([string]$Id)
+
+    $found = $null
+
+    # Source 0: what the SYSTEM half of this launch already resolved for us.
+    # Matched on id so a leftover from a previous game is ignored rather than
+    # launched.
+    $handoff = Join-Path $XsyncDir 'launch-target.json'
+    if (-not $found -and (Test-Path $handoff)) {
+        try {
+            $t = Get-Content $handoff -Raw | ConvertFrom-Json
+            if ($t -and $t.PSObject.Properties['id'] -and $t.id -eq $Id) {
+                Write-Log "resolved '$Id' from the pre-resolved launch target"
+                $found = $t
+            }
+        } catch {
+            Write-Log "launch target unreadable: $_" 'WARN'
+        }
+    }
+
+    if (-not $found) {
+        try {
+            foreach ($g in (Read-GameList -Path (Join-Path $XsyncDir 'games.json'))) {
+                if ($g.id -eq $Id) {
+                    Write-Log "resolved '$Id' from the cached game list"
+                    $found = $g
+                    break
+                }
+            }
+        } catch {
+            Write-Log "cached game list unreadable: $_" 'WARN'
+        }
+    }
+
+    if (-not $found) {
+        Write-Log "'$Id' not in the cached list - scanning $GamesRoot"
+        foreach ($g in @(Get-XboxGamesFromRoot)) {
+            if ($g.id -eq $Id) { $found = $g; break }
+        }
+    }
+
+    if (-not $found) { return $null }
+
+    # Refuse to hand back something that is not ONE game.
+    #
+    # This is the assertion that would have turned the bug above from a silent
+    # do-nothing launch into an immediate, named failure. A resolver that returns
+    # a collection must never reach Start-Process.
+    if ($found -is [array] -or $found.aumid -is [array]) {
+        Write-Log ("resolver returned {0} candidates for '{1}' - refusing to launch an ambiguous target" -f `
+                   @($found.aumid).Count, $Id) 'ERROR'
+        return $null
+    }
+
+    return $found
 }
 
 function Start-XboxGame {
     param([string]$Id)
 
-    $game = Get-InstalledXboxGames | Where-Object { $_.id -eq $Id } | Select-Object -First 1
+    $game = Resolve-GameById -Id $Id
     if (-not $game) {
         Write-Log "unknown game id '$Id' - falling back to the Xbox app" 'ERROR'
         Start-XboxApp
@@ -243,8 +578,25 @@ function Start-XboxGame {
     }
 
     Write-Log "launching $($game.name) [$($game.aumid)]"
-    Start-Process 'explorer.exe' -ArgumentList ("shell:appsFolder\{0}" -f $game.aumid)
-    return $game
+    if (Start-PackagedApp -Aumid $game.aumid -What $game.name) {
+        return $game
+    }
+
+    # Activation was REFUSED, which is not the same as a game that failed to
+    # start. Windows told us so up front, with a code.
+    #
+    # Reporting this game as playing anyway leaves the user looking at a black
+    # television until the watcher's grace period expires, for a process that was
+    # never going to exist. Landing them on the Xbox app instead costs the same
+    # handoff and gives them somewhere to actually read what is wrong.
+    #
+    # Real case: Sunset Overdrive returns 0x80070BFF, "a licensing operation is
+    # being performed", on every attempt, while Forza activates cleanly seconds
+    # later in the same session -- i.e. an entitlement problem for that one
+    # title, which the Xbox app can explain and this agent cannot.
+    Write-Log ("{0} could not be activated - dropping to the Xbox app so there is something on screen" -f $game.name) 'ERROR'
+    Start-XboxApp
+    return $null
 }
 
 # A Game Pass title runs from its own install directory, so "is it still
@@ -327,10 +679,38 @@ function Test-DownloadActive {
         }
     } catch { }
 
-    # Size sampling. Only counts as active if it grows by more than a trivial
-    # amount, so ordinary log and save writes do not read as a download.
     $root = 'C:\XboxGames'
     if (-not (Test-Path $root)) { return $false }
+
+    # A download that is PENDING counts, not just one that is moving bytes.
+    #
+    # Game Pass stages an install into a GUID-named folder under C:\XboxGames and
+    # renames it to the title only on completion. That folder is the durable
+    # record that an install is unfinished; the transfer itself stops and starts
+    # -- across a guest reboot it can take minutes to resume, and both the
+    # Delivery Optimization check above and the growth sample below read as "no"
+    # for the whole of that window.
+    #
+    # Which is exactly the case this whole feature exists for. Measured 29 Jul:
+    # Conker was 0.24 GB into a 4.85 GB install when the profile switched; the
+    # session was quit 60s after the guest came back, `downloading` answered no
+    # because the transfer had not resumed yet, teardown started no watcher --
+    # and the staging folder was still sitting there at 3.12 GB afterwards,
+    # finishing only because the guest happened to be booted again by hand.
+    #
+    # A leftover folder from a cancelled install would keep the guest up
+    # needlessly, which is the safe direction: the watcher has its own ceiling,
+    # and the alternative is silently throwing away a part-finished download.
+    $staging = @(Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -match '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-' })
+    if ($staging.Count -gt 0) {
+        Write-Log ("download pending: {0} unfinished install folder(s) under {1} [{2}]" -f `
+                   $staging.Count, $root, ($staging.Name -join ', '))
+        return $true
+    }
+
+    # Size sampling. Only counts as active if it grows by more than a trivial
+    # amount, so ordinary log and save writes do not read as a download.
     function _sz {
         try { return (Get-ChildItem $root -Recurse -File -ErrorAction SilentlyContinue |
                       Measure-Object -Property Length -Sum).Sum } catch { return 0 }
@@ -348,9 +728,27 @@ function Test-DownloadActive {
 
 function Get-AnyXboxGameProcess {
     try {
-        $root = $GamesRoot.TrimEnd('\') + '\'
-        return @(Get-CimInstance Win32_Process -ErrorAction Stop |
-                 Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, 'OrdinalIgnoreCase') })
+        $roots = @($GamesRoot.TrimEnd('\') + '\')
+
+        # C:\XboxGames is not the whole library. Store-era titles install under
+        # WindowsApps instead (Sunset Overdrive does), so matching only on the
+        # Game Pass root reports "nothing running" while one of them is on
+        # screen -- and every caller reads that as "the session is over".
+        # The cached list already knows where each title lives; use it.
+        try {
+            # Read-GameList, not a bare ConvertFrom-Json pipeline: see the note on
+            # that function for why 5.1 does not enumerate here.
+            foreach ($g in (Read-GameList -Path (Join-Path $XsyncDir 'games.json'))) {
+                if ($g.PSObject.Properties['install_path'] -and $g.install_path) {
+                    $roots += ($g.install_path.TrimEnd('\') + '\')
+                }
+            }
+        } catch { }
+
+        return @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            $p = $_.ExecutablePath
+            $p -and @($roots | Where-Object { $p.StartsWith($_, 'OrdinalIgnoreCase') }).Count -gt 0
+        })
     } catch {
         return @()
     }
@@ -1319,6 +1717,18 @@ function Start-Watcher {
     A scheduled task with an Interactive principal is the standard way across the
     session boundary: register, run, wait, clean up.
 #>
+# Failure text for the host, with the guest-side reason folded in when we have
+# one. The host surfaces this as `guest stderr:`, and it is the only place an
+# operator sees it without booting the guest to read agent.log.
+function Format-UserSessionFailure {
+    param([string]$What, $Result)
+    $msg = "$What in the user session failed with result $Result"
+    if ($script:LastUserSessionError) {
+        $msg += ' -- ' + ($script:LastUserSessionError -replace '\s+', ' ')
+    }
+    return $msg
+}
+
 function Invoke-InUserSession {
     param(
         [string]$Path,
@@ -1333,6 +1743,29 @@ function Invoke-InUserSession {
 
     if (-not (Test-Path $Path)) { throw "script not found: $Path" }
 
+    # Bring the REASON back, not just an exit code.
+    #
+    # A scheduled task hands its caller LastTaskResult and nothing else, so every
+    # failure in here reached the host as the bare string "result 1". The actual
+    # exception was written to the guest's own agent.log -- inside a VM that the
+    # failure itself then caused to be powered off, on a machine where reading
+    # that log means booting the maint profile. A launch broke for a whole
+    # evening and the host log could say nothing about why.
+    #
+    # So wrap the target in a try/catch that spools the error where the caller
+    # can read it. Named after the target script rather than a fixed path,
+    # because launch and enumerate can be in flight at the same time.
+    $tag     = [IO.Path]::GetFileNameWithoutExtension($Path)
+    $errFile = Join-Path $XsyncDir "$tag-error.txt"
+    $wrapper = Join-Path $XsyncDir "$tag-wrapper.ps1"
+    Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+    # -Encoding UTF8 writes a BOM on Windows PowerShell 5.1; without it a
+    # non-ASCII game name in an error message can derail the parser.
+    @"
+try { & '$Path' }
+catch { `$_ | Out-String | Set-Content -Path '$errFile' -Encoding UTF8; exit 1 }
+"@ | Set-Content -Path $wrapper -Encoding UTF8
+
     # The console user, i.e. whoever is actually logged in at the desktop.
     $user = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
     if (-not $user) { throw 'no interactive user is logged on' }
@@ -1340,7 +1773,7 @@ function Invoke-InUserSession {
 
     $taskName = 'xsync-runas'
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $Path)
+        -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $wrapper)
     $runLevel = if ($Elevated) { 'Highest' } else { 'Limited' }
     Write-Log "run level: $runLevel"
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel $runLevel
@@ -1360,6 +1793,22 @@ function Invoke-InUserSession {
         }
         $result = (Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue).LastTaskResult
         Write-Log "user-session task finished with result $result"
+        if ($result -ne 0) {
+            $reason = ''
+            try {
+                if (Test-Path $errFile) { $reason = (Get-Content $errFile -Raw -ErrorAction Stop).Trim() }
+            } catch { }
+            if ($reason) {
+                # One line, so it survives the host's stderr capture intact.
+                Write-Log ("user-session failure: {0}" -f ($reason -replace '\s+', ' ')) 'ERROR'
+                $script:LastUserSessionError = $reason
+            } else {
+                Write-Log 'user-session failed but left no error detail' 'WARN'
+                $script:LastUserSessionError = ''
+            }
+        } else {
+            $script:LastUserSessionError = ''
+        }
         return $result
     } finally {
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -1418,6 +1867,48 @@ function Install-Agent {
     if (-not $interactiveUser) {
         throw 'no interactive user is logged on; cannot register the watcher task. Run this after autologon has completed.'
     }
+    # The interactive user must be able to WRITE C:\ProgramData\xsync, not just
+    # create in it.
+    #
+    # The directory is made by the agent running as Local System, so it inherits
+    # ProgramData's default ACL: Users get ReadAndExecute plus Write, which allows
+    # creating a new file but NOT modifying one an administrator already owns.
+    # agent.log is created by SYSTEM and owned by BUILTIN\Administrators, so every
+    # unelevated append to it fails with UnauthorizedAccessException -- and
+    # Write-Log swallows that after its retry loop rather than surfacing it.
+    #
+    # Launch is the one path that must run unelevated, which makes it exactly the
+    # path whose log lines silently vanish. That is not a cosmetic problem: when
+    # the launch broke, the guest log had nothing at all between "run level:
+    # Limited" and "result 1", so the only record of the failure was an exit code.
+    # Measured on the guest to confirm, from a Limited token:
+    #   agent.log -> "Access to the path ... is denied", owner BUILTIN\Administrators
+    #   creating a NEW file in the same directory -> allowed
+    #
+    # Grant Modify, inherited, so the log works from every context xsync runs in.
+    try {
+        $acl  = Get-Acl -Path $XsyncDir
+        $acl.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            $interactiveUser, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+        Set-Acl -Path $XsyncDir -AclObject $acl
+
+        # Inheritance does not reach back to files that already exist, and
+        # agent.log is always one of them by the time we get here.
+        foreach ($f in @(Get-ChildItem -Path $XsyncDir -File -ErrorAction SilentlyContinue)) {
+            try {
+                $fa = Get-Acl -Path $f.FullName
+                $fa.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                    $interactiveUser, 'Modify', 'None', 'None', 'Allow')))
+                Set-Acl -Path $f.FullName -AclObject $fa
+            } catch {
+                Write-Log "could not grant modify on $($f.Name): $($_.Exception.Message)" 'WARN'
+            }
+        }
+        Write-Log "granted $interactiveUser modify on $XsyncDir"
+    } catch {
+        Write-Log "could not grant $interactiveUser modify on ${XsyncDir}: $_" 'WARN'
+    }
+
     Write-Log "registering watcher for interactive user $interactiveUser"
     $princ   = New-ScheduledTaskPrincipal -UserId $interactiveUser -RunLevel Highest -LogonType Interactive
 
@@ -1440,18 +1931,25 @@ switch ($Action) {
             $shim = Join-Path $XsyncDir 'enumerate-shim.ps1'
             "& '$PSCommandPath' -Action enumerate | Set-Content -Path '$out' -Encoding UTF8" |
                 Set-Content -Path $shim -Encoding UTF8
-            # Elevated: Get-AppxPackageManifest needs admin to read the manifest,
-            # and without it the AUMID cannot be resolved, so every game is
-            # silently skipped and the library looks empty. Safe to elevate here
-            # because this only reads package metadata - unlike the launch path,
-            # which must stay unelevated or UWP apps refuse to start.
+            # Elevated because Get-AppxPackage -AllUsers is admin-only, and
+            # without it the WindowsApps titles are invisible. MEASURED on the
+            # guest, unelevated in the interactive session:
+            #   Get-AppxPackage -AllUsers -> UnauthorizedAccessException, and it
+            #   throws TERMINATING, straight past -ErrorAction SilentlyContinue.
+            # Get-AppxPackageManifest, by contrast, reads fine without admin
+            # (Forza resolved to 'Forzahorizon6' from a Limited token), so it is
+            # NOT the reason this arm elevates - an earlier comment here said it
+            # was, and that was wrong.
+            # Safe to elevate because this only reads package metadata - unlike
+            # the launch path, which must stay unelevated or UWP apps refuse to
+            # start.
             # Delete any previous result first. Otherwise a failed dispatch falls
             # through to Test-Path succeeding against the LAST run's games.json,
             # and a stale library is returned as current with no indication that
             # anything went wrong.
             Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
             $rc = Invoke-InUserSession -Path $shim -TimeoutSeconds 120 -Elevated
-            if ($rc -ne 0) { throw "enumerate task in the user session failed with result $rc" }
+            if ($rc -ne 0) { throw (Format-UserSessionFailure -What 'enumerate task' -Result $rc) }
             if ((Test-Path $out) -and (Get-Item $out).Length -gt 0) { Get-Content $out -Raw } else { '[]' }
         } else {
             $games = Get-InstalledXboxGames
@@ -1477,7 +1975,7 @@ switch ($Action) {
         # the operator saw success, rebooted expecting Xbox mode, and got an
         # unchanged desktop with the cause buried in a guest log file.
         $rc = Invoke-InUserSession -Path $ScriptPath -Elevated
-        if ($rc -ne 0) { throw "user-session script failed with result $rc" }
+        if ($rc -ne 0) { throw (Format-UserSessionFailure -What "script $ScriptPath" -Result $rc) }
     }
 
     'launch' {
@@ -1495,6 +1993,34 @@ switch ($Action) {
         # session first and let that copy do the real work.
         if (([Security.Principal.WindowsIdentity]::GetCurrent()).IsSystem) {
             Write-Log "running as SYSTEM - re-dispatching launch into the user session"
+
+            # Resolve the AUMID HERE, while we still have the privileges for it.
+            #
+            # Get-AppxPackageManifest -- the only way to learn a package's real
+            # app id -- needs admin, and the user session we are about to hand
+            # this to deliberately has no admin (packaged apps refuse to start
+            # from an elevated process). Resolving after the drop meant either a
+            # hard failure or, worse, a silently guessed app id of 'App': Forza's
+            # is 'Forzahorizon6', so the shell was handed an AUMID matching
+            # nothing, no game started, and the session was torn down as idle.
+            #
+            # SYSTEM is elevated, so do it now and leave the answer on disk for
+            # the unelevated copy to pick up. Non-fatal: if this cannot resolve,
+            # the user session still has its own fallbacks.
+            try {
+                $target = Resolve-GameById -Id $GameId
+                if ($target) {
+                    $target | ConvertTo-Json -Depth 5 |
+                        Set-Content -Path (Join-Path $XsyncDir 'launch-target.json') -Encoding UTF8
+                    Write-Log "pre-resolved '$GameId' -> $($target.aumid)"
+                } else {
+                    Remove-Item (Join-Path $XsyncDir 'launch-target.json') -Force -ErrorAction SilentlyContinue
+                    Write-Log "could not pre-resolve '$GameId'" 'WARN'
+                }
+            } catch {
+                Write-Log "pre-resolve failed for '$GameId': $_" 'WARN'
+            }
+
             $shim = Join-Path $XsyncDir 'launch-shim.ps1'
             # -Encoding UTF8 writes a BOM on Windows PowerShell 5.1, which is what
             # keeps this parseable if the game name carries non-ASCII characters.
@@ -1504,7 +2030,7 @@ switch ($Action) {
             # even when the user-session task never ran, so the host tore down
             # the display session and waited for a game that was never started.
             $rc = Invoke-InUserSession -Path $shim -TimeoutSeconds 180
-            if ($rc -ne 0) { throw "launch task in the user session failed with result $rc" }
+            if ($rc -ne 0) { throw (Format-UserSessionFailure -What 'launch task' -Result $rc) }
             'launched'
             break
         }
@@ -1538,7 +2064,10 @@ switch ($Action) {
                 #
                 # A stale slug is entirely ordinary: shortcuts outlive titles
                 # rotating out of Game Pass, and nothing validates the id.
-                Write-Log "could not resolve '$GameId' - supervising the Xbox app so there is still a way out" 'WARN'
+                # Reached either because the id did not resolve or because the
+                # app refused to activate; Start-XboxGame has already logged
+                # which, with the HRESULT where there was one.
+                Write-Log "could not start '$GameId' - supervising the Xbox app so there is still a way out" 'WARN'
                 Save-State @{
                     playing      = $true
                     id           = 'xbox-app'
@@ -1586,7 +2115,33 @@ switch ($Action) {
     'status' {
         $state = Get-State
         $playing = $false
-        if ($state -and $state.PSObject.Properties['install_path'] -and $state.install_path) {
+
+        # An explicit "the session is over" beats every live process check.
+        #
+        # When a game exits the watcher records
+        #     Save-State @{ playing = $false; ended_at = ... }
+        # and that record has no install_path -- so this arm used to fall through
+        # to the Xbox-app branch below, which asks whether XboxPcApp is running.
+        # It always is. The host was therefore told playing:true for the entire
+        # shutdown, never saw the game stop, never incremented `misses`, and never
+        # took the `misses == 1` final capture. The guest sat waiting out its 45s
+        # for a marker that could not come and powered off regardless
+        # ("host never collected the final game list - shutting down anyway").
+        #
+        # That is why a game installed during a session never reached Steam: the
+        # only capture that could see it was the one this defect suppressed.
+        # Measured 29 Jul: game quit 12:26:20, VM gone 12:27:16, zero misses
+        # logged, no final capture, on two consecutive runs.
+        $ended = $false
+        if ($state) {
+            if ($state.PSObject.Properties['ended_at']) { $ended = $true }
+            elseif ($state.PSObject.Properties['playing'] -and -not $state.playing) { $ended = $true }
+        }
+
+        if ($ended) {
+            Write-Log 'state says the session has ended - reporting not playing'
+            $playing = $false
+        } elseif ($state -and $state.PSObject.Properties['install_path'] -and $state.install_path) {
             $exe = ''
             if ($state.PSObject.Properties['executable']) { $exe = $state.executable }
             $playing = @(Get-GameProcesses -InstallPath $state.install_path -Executable $exe).Count -gt 0
@@ -1606,9 +2161,33 @@ switch ($Action) {
             # guest watcher and its backstop agreeing on the same wrong answer.
             $playing = (@(Get-Process -Name 'XboxPcApp', 'GamingApp', 'Xbox' -ErrorAction SilentlyContinue).Count -gt 0) `
                     -or (@(Get-AnyXboxGameProcess).Count -gt 0)
+        } else {
+            # No session state for this boot -- and a game may STILL be running.
+            #
+            # This branch used to report playing:false unconditionally, which
+            # made a failed launch unrecoverable by hand. The host waits to see
+            # playing:true once before it will supervise anything, so with no
+            # state it concluded "no game ever started" and powered the VM off
+            # 300s later. Someone whose launch dropped them on the Xbox app and
+            # who then started the game themselves -- the obvious thing to do --
+            # got roughly five minutes of play and then a hard shutdown.
+            #
+            # Deliberately asks about GAME processes only, not the Xbox app: an
+            # idle launcher must still let the no-game-started backstop fire.
+            $playing = @(Get-AnyXboxGameProcess).Count -gt 0
+            if ($playing) { Write-Log 'no state for this boot, but a game is running - reporting playing' 'WARN' }
         }
+        # `ended` is NOT the inverse of `playing`.
+        #
+        # "not playing" covers a game that has not started yet as well as one
+        # that has finished, and the host needs to tell those apart: it takes its
+        # one final game-list capture on the way out, and spending it during the
+        # launch window means the capture that could see a game installed this
+        # session never happens. Only the watcher writes ended_at, and only once
+        # the session is genuinely over.
         [pscustomobject]@{
             playing = $playing
+            ended   = $ended
             game    = if ($state -and $state.PSObject.Properties['id']) { $state.id } else { $null }
         } | ConvertTo-Json -Compress
     }

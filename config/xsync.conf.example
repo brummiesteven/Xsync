@@ -216,6 +216,64 @@ XSYNC_BOOT_TIMEOUT=300
 XSYNC_HEARTBEAT_TIMEOUT=30
 # Seconds to wait for graceful VM shutdown before `virsh destroy`.
 XSYNC_SHUTDOWN_TIMEOUT=60
+# Seconds to wait for Windows to finish autologon and present an interactive
+# desktop, measured from the moment the guest agent answers. Separate from
+# XSYNC_BOOT_TIMEOUT because the two failures cost very different things: the
+# agent not answering happens while the TV is already black and unavoidably so,
+# whereas this wait happens with the host session torn down and the GPU handed
+# over, so every second of it is a black television the user cannot escape.
+#
+# A healthy guest gets here in 5-6s. A guest recovering from a dirty shutdown has
+# been measured at over 100s, so the floor is not tiny. 180s keeps that margin
+# while capping the black screen at three minutes; the session then ABORTS and
+# restores gaming mode rather than pressing on into a launch that cannot work.
+XSYNC_USER_TIMEOUT=180
+
+# Consecutive "not playing" readings before the host ends a session. Deliberately
+# more than one: a dropped guest-agent call must not look like a finished game.
+XSYNC_EXIT_CONFIRMATIONS=3
+
+# Seconds the exit monitor waits before it will act on "not playing" at all. It
+# starts polling immediately -- this gates only the DECISION to end a session, so
+# a slow-loading game cannot be mistaken for one that has already exited.
+XSYNC_GAME_START_GRACE=180
+
+# Seconds the guest holds its shutdown open waiting for the host to take the final
+# game list. Too short and a game installed during the session never reaches Steam.
+XSYNC_EXIT_GRACE_SECONDS=45
+
+# Background download watcher: how often to check, and the absolute ceiling on how
+# long the guest may stay up headless finishing a Game Pass install.
+XSYNC_DOWNLOAD_POLL=120
+XSYNC_DOWNLOAD_MAX_SECONDS=43200
+
+# Display watch: how often to look for the TV coming back, and how long to wait
+# for it after a GPU reclaim before giving up and saying so.
+XSYNC_DISPLAY_POLL=10
+XSYNC_DISPLAY_WAIT=20
+
+# Reclaim the GPU even if something still holds it. Off by default: forcing it
+# while a client has the device open is a good way to wedge the driver.
+XSYNC_FORCE_RECLAIM=0
+
+# Install from the working tree via a symlink instead of a root-owned copy. For
+# hacking on xsync itself; never for a machine you actually play on.
+XSYNC_DEV_INSTALL=0
+
+# The Steam entry that triggers guest maintenance. Changing the id orphans the
+# existing shortcut, so change the name only unless you also resync.
+XSYNC_MAINTENANCE_ID=xsync-maintenance
+XSYNC_MAINTENANCE_NAME=xsync: Guest Maintenance
+
+# Absolute ceiling on a play session, in seconds. Nothing should hold the GPU
+# forever: if something has gone wrong the user has lost their desktop and needs
+# it back more than they need the game. 12 hours.
+XSYNC_MAX_SESSION_SECONDS=43200
+
+# How many consecutive failures to restore the host session before giving up on
+# retrying it. The display watcher takes over from there.
+XSYNC_MAX_RESTORE_FAILURES=3
+
 # Retries for GPU rebind before giving up and restoring the session regardless.
 XSYNC_GPU_REBIND_RETRIES=3
 

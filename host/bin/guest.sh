@@ -205,6 +205,22 @@ guest_playing() {
     agent status 2>/dev/null | grep -q '"playing"[[:space:]]*:[[:space:]]*true'
 }
 
+# Has the guest declared the session OVER, as opposed to merely not playing yet?
+#
+# The distinction matters for exactly one thing: the host takes a single final
+# game-list capture on the way out, and "not playing" is also true for the whole
+# launch window before the game appears. Spending the capture there means the one
+# snapshot that could include a game installed during this session never gets
+# taken. Only the guest watcher sets this, and only once the game has gone.
+guest_ended() {
+    # Bounded, because this runs inside the exit monitor's poll loop. A status
+    # query is a sub-second operation; inheriting the 300s guest-exec default
+    # would let one unlucky call stall the supervisory loop for five minutes,
+    # which is precisely when it needs to be responsive.
+    local XSYNC_GUEST_EXEC_TIMEOUT=15
+    agent status 2>/dev/null | grep -q '"ended"[[:space:]]*:[[:space:]]*true'
+}
+
 # Copy a file from the host into the guest over the agent channel.
 #
 # Scripts are pushed with a UTF-8 BOM for the same reason xsync-make-unattend
@@ -334,7 +350,10 @@ guest_run_user() {
 # actually breaks the launch, so it cannot report ready while launching would
 # still fail.
 guest_wait_user() {
-    local timeout="${1:-$XSYNC_BOOT_TIMEOUT}"
+    # Its own budget, not the agent's. See XSYNC_USER_TIMEOUT in xsync.conf:
+    # this wait happens with the host session already gone, so it is paid for in
+    # black-screen seconds, and it warrants a tighter bound than the agent wait.
+    local timeout="${1:-${XSYNC_USER_TIMEOUT:-$XSYNC_BOOT_TIMEOUT}}"
 
     # Probe with tasklist, not PowerShell, and bound every probe.
     #
@@ -370,7 +389,29 @@ guest_wait_user() {
         (( $(date +%s) >= deadline )) && break
         sleep 3
     done
+    # Say what the guest WAS doing, not just that it failed.
+    #
+    # This fires intermittently (3 of 19 launches on 29 Jul) and the bare
+    # "no interactive session" told nobody anything: the guest is powered off
+    # moments later by the abort, taking the evidence with it. Grab it here,
+    # while the agent is still answering, because there is no second chance.
+    #
+    # Probes are individually bounded and every one is best-effort: this runs on
+    # a path that is already failing and must not make things worse.
     error "no interactive session appeared within ${timeout}s"
+    (
+        local XSYNC_GUEST_EXEC_TIMEOUT=15
+        local who procs
+        who="$(guest_exec 'C:\Windows\System32\query.exe' user 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
+        [[ -n "$who" ]] && error "  logged-on sessions: ${who}" || error "  logged-on sessions: <none reported>"
+
+        procs="$(guest_exec 'C:\Windows\System32\tasklist.exe' /NH 2>/dev/null \
+                 | tr -d '\r' | awk '{print $1}' \
+                 | grep -iE 'explorer|logonui|winlogon|userinit|sihost|XboxPcApp|StartMenu|dwm' \
+                 | sort -u | tr '\n' ' ')"
+        [[ -n "$procs" ]] && error "  shell processes present: ${procs}" \
+                          || error "  shell processes present: <none of explorer/logonui/winlogon/userinit/sihost/dwm>"
+    ) || true
     return 1
 }
 
@@ -448,11 +489,12 @@ case "${1:-ping}" in
     games)    guest_games ;;
     launch)   guest_launch "${2:-}" ;;
     playing)  guest_playing && echo yes || { echo no; exit 1; } ;;
+    ended)    guest_ended && echo yes || { echo no; exit 1; } ;;
     downloading) guest_downloading && echo yes || { echo no; exit 1; } ;;
     boot-id)  guest_boot_id ;;
     push)     guest_push "${2:?source}" "${3:?destination}" ;;
     pull)     guest_pull "${2:?source}" "${3:?destination}" ;;
     run-user) guest_run_user "${2:?script}" ;;
     shutdown) guest_shutdown ;;
-    *) echo "usage: $0 {ping|wait|wait-user|exec|ps|games|launch|playing|downloading|boot-id|push|pull|run-user|shutdown}" >&2; exit 64 ;;
+    *) echo "usage: $0 {ping|wait|wait-user|exec|ps|games|launch|playing|ended|downloading|boot-id|push|pull|run-user|shutdown}" >&2; exit 64 ;;
 esac
