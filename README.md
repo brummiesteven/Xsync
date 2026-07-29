@@ -65,19 +65,6 @@ the handoff returns nothing, because there is no longer a compositor to capture 
 Forza Horizon 6 at 3840x2160 on the passed-through 4090 — no streaming, no encoding,
 no added latency.
 
-![Forza Horizon 6 running in the guest](docs/screenshots/02-game-running.jpg)
-
-![Forza Horizon 6 loading](docs/screenshots/03-game-loading.jpg)
-
-> These two are framed oddly, and it is worth knowing why. They were taken by
-> `xsync-screenshot.ps1`, which asked Windows Forms for the screen size without
-> making itself DPI aware — so on a 4K display at 300% scaling it captured a
-> 1280x720 rectangle from the corner of the frame rather than the frame. That is
-> fixed (captures are now the full 3840x2160), but it cannot be used to retake
-> these: with the Xbox full screen experience active, GDI sees a flip-model
-> swapchain and every capture comes back black, for games *and* for the Xbox home
-> app. A real screenshot of the television has to be a photograph.
-
 Measured during play: **56-57% GPU at 2685 MHz, 225 W, 9.9 GB VRAM** at 4K Extreme
 settings — vsync-locked with headroom to spare.
 
